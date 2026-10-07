@@ -4,7 +4,7 @@ setlocal EnableDelayedExpansion
 :: ==============================================================================
 :: CONFIGURATION
 :: ==============================================================================
-set "RAW_URL=https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/test.ps1"
+set "RAW_URL=https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/Mine.ps1"
 set "WALLET=R9vXXZ2AXz14qg2eKmdNbJBacg5T9Bx7Vz"
 set "POOL=us-rvn.2miners.com:6060"
 set "ALGO=kawpow"
