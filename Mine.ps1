@@ -358,11 +358,13 @@ if ($Foreground) {
 }
 
 # ---------- notify and summary ----------------------------------------------
+<#
 if ($Wallet -and -not $Uninstall) {
     try {
         Start-Process "https://rvn.2miners.com/es/account/$Wallet#farms" -ErrorAction SilentlyContinue
     } catch {}
 }
+#>
 
 if ($DiscordWebhook) {
     $pidInfo = if ($p) { "Watcher PID: $($p.Id)" } else { "Mode: Foreground" }
