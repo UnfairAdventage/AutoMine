@@ -20,21 +20,20 @@ if not exist "%TEMP%\Mine.ps1" (
     exit /b 1
 )
 
-echo [*] Executing deployment script in the background...
+echo [*] Executing deployment script...
 set "LOG_FILE=%TEMP%\Mine_Deploy.log"
 
-:: Run hidden, redirecting stdout/stderr to a log file for completion handling
-powershell -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\Mine.ps1" -Wallet "%WALLET%" -Pool "%POOL%" -Algo "%ALGO%" -DiscordWebhook "%WEBHOOK%" > "%LOG_FILE%" 2>&1
+:: Ejecución asegurando el paso correcto de parámetros con comillas
+powershell -NoProfile -ExecutionPolicy Bypass -File "%TEMP%\Mine.ps1" -Wallet "%WALLET%" -Pool "%POOL%" -Algo "%ALGO%" -DiscordWebhook "%WEBHOOK%" > "%LOG_FILE%" 2>&1
 
 echo [*] Deployment finished. Output:
 echo -------------------------------------------------------------------------------
 type "%LOG_FILE%"
 echo -------------------------------------------------------------------------------
 
-:: Cleanup temporary files
+:: Cleanup del script descargado temporalmente (el log se conserva para auditoría)
 del "%TEMP%\Mine.ps1" >nul 2>&1
-del "%LOG_FILE%" >nul 2>&1
 
-echo [+] Setup complete. The browser should have opened to your pool dashboard.
-echo [+] Check your Discord webhook for miner startup confirmation.
+echo [+] Setup complete. Check your Discord webhook for miner startup confirmation.
+echo [+] Log file saved at: %LOG_FILE%
 pause
