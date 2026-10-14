@@ -16,7 +16,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-WebRequest -Uri '
 
 if not exist "%TEMP%\Mine.ps1" (
     echo [!] Failed to download script. Check the RAW_URL and your internet connection.
-    pause
     exit /b 1
 )
 
@@ -37,4 +36,4 @@ del "%LOG_FILE%" >nul 2>&1
 
 echo [+] Setup complete. The browser should have opened to your pool dashboard.
 echo [+] Check your Discord webhook for miner startup confirmation.
-pause
+exit /b 0
