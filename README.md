@@ -77,7 +77,7 @@ Esta herramienta está diseñada para ser utilizada **únicamente en equipos de 
 | `-Run` | Modo interno del watcher. No usar manualmente. | `false` |
 | `-NoElevate` | Modo interno para evitar el bucle de UAC. No usar manualmente. | `false` |
 
-## 🔧 Ejemplos de uso
+## Ejemplos de uso
 
 **Instalación con perfil de overclock personalizado (RTX 3050):**
 
