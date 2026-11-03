@@ -41,7 +41,7 @@ Esta herramienta está diseñada para ser utilizada **únicamente en equipos de 
               -Pool "us-rvn.2miners.com:6060" `
               -Algo "kawpow" `
               -DiscordWebhook "https://discord.com/api/webhooks/TU_ID/TU_TOKEN"
-```
+   ```
 
 Método 2: Ejecución en Memoria (Sin descargar a disco)
 
