@@ -151,6 +151,78 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
+# ---------- secure admin revocation + utilman.exe integrity check & repair -----
+# Compatible: Windows 10 (1607+) / Windows 11 · Requiere PowerShell como Admin
+
+$AdminGroupSID = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+try {
+    $AdminGroupName = $AdminGroupSID.Translate([System.Security.Principal.NTAccount]).Value
+} catch {
+    Write-Host '[-] No se pudo resolver el nombre del grupo Administradores.'
+    exit 1
+}
+
+function Test-IsElevated {
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object System.Security.Principal.WindowsPrincipal($id)
+        ).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-AdminMembers {
+    try   { return @(Get-LocalGroupMember -Group $AdminGroupName -ErrorAction Stop) }
+    catch {
+        # Fallback por SID si el nombre traducido falla
+        return @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue)
+    }
+}
+
+function Test-BackupAdmin {
+    Write-Host "[*] Comprobando cuentas de administrador en '$AdminGroupName'..."
+    $members = Get-AdminMembers
+
+    if (-not $members -or $members.Count -eq 0) {
+        Write-Host '[-] Ninguna cuenta de administrador encontrada. No se revocan permisos.'
+        return $false
+    }
+
+    foreach ($m in $members) {
+        Write-Host "    - $($m.Name) [$($m.ObjectClass)]"
+    }
+
+    if ($members.Count -le 1) {
+        Write-Host '[-] Solo existe 1 cuenta de administrador. No se revocan permisos (evita bloquear el sistema).'
+        return $false
+    }
+
+    Write-Host "[+] $($members.Count) cuentas de administrador presentes. Seguro para proceder."
+    return $true
+}
+
+function Remove-CurrentUserAdmin {
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+
+    $isAdmin = $me.Groups | Where-Object { $_.Value -eq $AdminGroupSID.Value }
+    if (-not $isAdmin) {
+        Write-Host "[+] El usuario actual ($($me.Name)) ya no es administrador."
+        return
+    }
+
+    Write-Host "[*] Revocando privilegios de Administrador a '$($me.Name)'..."
+    try {
+        Remove-LocalGroupMember -Group $AdminGroupName -Member $me.Name -ErrorAction Stop
+        Write-Host '[+] Privilegios revocados. Cierre sesión para que surta efecto.'
+    } catch {
+        Write-Host "[-] Falló la revocación vía cmdlet: $_"
+        # Fallback CLI clásico (funciona con cuentas Microsoft/Entra en algunos casos)
+        net localgroup $AdminGroupName "$($me.Name)" /delete 2>$null | Out-Null
+        if (-not ((Get-AdminMembers | Where-Object { $_.Name -like "*$($me.Name.Split('\')[-1])*" }))) {
+            Write-Host '[+] Privilegios revocados vía fallback CLI.'
+        } else {
+            Write-Host '[-] No se pudo revocar el acceso de administrador.'
+        }
+    }
+}
+
 # ---------- utilman.exe integrity check & repair ----------------------------
 function Get-UtilmanBackup {
     # Copia de componente más reciente en WinSxS (sin recursión completa, que es lentísima)
