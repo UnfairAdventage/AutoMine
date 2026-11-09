@@ -55,8 +55,11 @@ function Unprotect-Files {
     if (Test-Path $Path) {
         Write-Host '[*] Removiendo protección de archivos (esto puede tardar unos segundos)...'
         
+        # Detectar el idioma del sistema para la confirmación de takeown (S en español, Y en inglés)
+        $confirm = if ((Get-WinSystemLocale).Name -match '^es') { 'S' } else { 'Y' }
+        
         # 1. Tomar posesión forzosa de la carpeta y subcarpetas
-        & takeown.exe /f $Path /r /d y 2>&1 | Out-Null
+        & takeown.exe /f $Path /r /d $confirm 2>&1 | Out-Null
         
         # 2. Otorgar Control Total al SID de Administradores (sobrescribe la denegación)
         & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1 | Out-Null
