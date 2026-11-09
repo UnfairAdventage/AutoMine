@@ -53,10 +53,19 @@ function Send-DiscordWebhook {
 function Unprotect-Files {
     param([string]$Path)
     if (Test-Path $Path) {
-        Write-Host '[*] Removiendo protección de archivos...'
-        # El parámetro /T aplica el cambio a la carpeta y a TODOS los archivos internos
-        & icacls.exe $Path /inheritance:e /T 2>&1 | Out-Null
-        & icacls.exe $Path /remove:d "*S-1-5-32-544" /T 2>&1 | Out-Null
+        Write-Host '[*] Removiendo protección de archivos (esto puede tardar unos segundos)...'
+        
+        # 1. Tomar posesión forzosa de la carpeta y subcarpetas
+        & takeown.exe /f $Path /r /d y 2>&1 | Out-Null
+        
+        # 2. Otorgar Control Total al SID de Administradores (sobrescribe la denegación)
+        & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1 | Out-Null
+        
+        # 3. Eliminar cualquier regla de denegación
+        & icacls.exe $Path /remove:d "*S-1-5-32-544" /T /C 2>&1 | Out-Null
+        
+        # 4. Restaurar la herencia de permisos por defecto
+        & icacls.exe $Path /inheritance:e /T /C 2>&1 | Out-Null
     }
 }
 
