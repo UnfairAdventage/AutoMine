@@ -52,12 +52,24 @@ function Send-DiscordWebhook {
     } catch { return $false }
 }
 
+function Stop-Safe {
+    Write-Host '[*] Deteniendo instancia anterior de forma segura...'
+    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+    foreach ($w in $watchers) {
+        Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Start-Sleep -Seconds 1
+    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
 function Force-Unlock {
     param([string]$Path)
     if (Test-Path $Path) {
         try {
             $confirm = if ((Get-WinSystemLocale).Name -match '^es') { 'S' } else { 'Y' }
             & takeown.exe /f $Path /r /d $confirm 2>&1 | Out-Null
+            & icacls.exe $Path /reset /T /C 2>&1 | Out-Null
             & icacls.exe $Path /grant "*S-1-5-32-544:(OI)(CI)F" /T /C 2>&1 | Out-Null
             & icacls.exe $Path /grant "*S-1-5-18:(OI)(CI)F" /T /C 2>&1 | Out-Null
             & icacls.exe $Path /remove:d "*S-1-5-32-544" /T /C 2>&1 | Out-Null
@@ -92,12 +104,18 @@ if ($TestWebhook) {
     return
 }
 
-# ---------- diagnose (MEJORADO) ---------------------------------------------
+# ---------- diagnose --------------------------------------------------------
 if ($Diagnose) {
     Write-Host '=================================================='
     Write-Host '  DIAGNÓSTICO DEL SISTEMA (WinCache Agent)'
     Write-Host '=================================================='
     
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Host "`n[!] NOTA: Ejecutando sin privilegios de Administrador." -ForegroundColor Yellow
+        Write-Host "    Algunas acciones (como forzar el inicio) pueden fallar." -ForegroundColor Yellow
+    }
+
     Write-Host "`n[+] 1. Verificando Tarea Programada..." -ForegroundColor Cyan
     $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     if ($task) { 
@@ -106,13 +124,18 @@ if ($Diagnose) {
         if ($task.State -eq 'Running') {
             Write-Host "    [OK] La tarea está corriendo." -ForegroundColor Green
         } else {
-            Write-Host "    [!] La tarea está en '$($task.State)'. Intentando iniciarla a la fuerza..." -ForegroundColor Yellow
-            try {
-                Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
-                Write-Host "    [OK] Comando de inicio enviado." -ForegroundColor Green
-                Start-Sleep -Seconds 2
-            } catch {
-                Write-Host "    [X] Error al iniciar la tarea: $_" -ForegroundColor Red
+            Write-Host "    [!] La tarea está en '$($task.State)'." -ForegroundColor Yellow
+            if ($isAdmin) {
+                Write-Host "    Intentando iniciarla a la fuerza..." -ForegroundColor Yellow
+                try {
+                    Start-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+                    Write-Host "    [OK] Comando de inicio enviado." -ForegroundColor Green
+                    Start-Sleep -Seconds 2
+                } catch {
+                    Write-Host "    [X] Error al iniciar la tarea: $_" -ForegroundColor Red
+                }
+            } else {
+                Write-Host "    [!] Se requieren permisos de Admin para forzar el inicio." -ForegroundColor Red
             }
         }
     } else { 
@@ -128,26 +151,30 @@ if ($Diagnose) {
     }
 
     Write-Host "`n[+] 3. Verificando Estado del Log (Prueba de Vida)..." -ForegroundColor Cyan
-    if (Test-Path $LogFile) {
-        $logInfo = Get-Item $LogFile
-        $timeDiff = (Get-Date) - $logInfo.LastWriteTime
-        Write-Host "    Última escritura en el log: $($logInfo.LastWriteTime)"
-        if ($timeDiff.TotalMinutes -lt 2) {
-            Write-Host "    [OK] El Watcher ESTÁ VIVO (escribió en el log hace $([math]::Round($timeDiff.TotalSeconds)) segundos)." -ForegroundColor Green
+    try {
+        if (Test-Path $LogFile) {
+            $logInfo = Get-Item $LogFile -ErrorAction Stop
+            $timeDiff = (Get-Date) - $logInfo.LastWriteTime
+            Write-Host "    Última escritura en el log: $($logInfo.LastWriteTime)"
+            if ($timeDiff.TotalMinutes -lt 2) {
+                Write-Host "    [OK] El Watcher ESTÁ VIVO (escribió en el log hace $([math]::Round($timeDiff.TotalSeconds)) segundos)." -ForegroundColor Green
+            } else {
+                Write-Host "    [!] El log no se actualiza hace $([math]::Round($timeDiff.TotalMinutes)) minutos. El Watcher podría estar colgado." -ForegroundColor Yellow
+            }
         } else {
-            Write-Host "    [!] El log no se actualiza hace $([math]::Round($timeDiff.TotalMinutes)) minutos. El Watcher podría estar colgado." -ForegroundColor Yellow
+            Write-Host "    [!] El archivo de log no existe o no tienes permiso para verlo." -ForegroundColor Red
         }
-    } else {
-        Write-Host "    [!] El archivo de log no existe." -ForegroundColor Red
+    } catch {
+        Write-Host "    [!] Acceso denegado al log (requiere admin para leer la carpeta oculta)." -ForegroundColor Yellow
     }
 
     Write-Host "`n[+] 4. Últimas líneas del Log..." -ForegroundColor Cyan
     try {
         if (Test-Path $LogFile) { 
-            Get-Content $LogFile -Tail 10 | ForEach-Object { Write-Host "    $_" } 
+            Get-Content $LogFile -Tail 10 -ErrorAction Stop | ForEach-Object { Write-Host "    $_" } 
         } 
     } catch {
-        Write-Host "    [!] No se pudo leer el log." -ForegroundColor Red
+        Write-Host "    [!] No se pudo leer el log por permisos." -ForegroundColor Red
     }
 
     Write-Host "`n=================================================="
@@ -155,7 +182,7 @@ if ($Diagnose) {
 }
 
 # ---------- elevation -------------------------------------------------------
-if (-not $Run -and -not $NoElevate) {
+if (-not $Run -and -not $NoElevate -and -not $Diagnose) {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pr = New-Object Security.Principal.WindowsPrincipal($id)
     if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -172,8 +199,12 @@ if (-not $Run -and -not $NoElevate) {
     }
 }
 
-# ---------- DESBLOQUEO INMEDIATO --------------------------------------------
+# ---------- PREPARACIÓN (POST-ELEVACIÓN) ------------------------------------
 if (-not $Run) {
+    # 1. Detener instancia anterior (libera bloqueos de archivo)
+    Stop-Safe
+    
+    # 2. Asegurar permisos
     Write-Host '[*] Asegurando permisos de la carpeta...'
     Force-Unlock -Path $Root
 }
@@ -197,12 +228,6 @@ try {
 
 # 2. DESINSTALACIÓN
 if ($Uninstall) {
-    Write-Host '[*] Deteniendo instancia anterior...'
-    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue | Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
-    foreach ($w in $watchers) { Stop-Process -Id $w.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Seconds 1
-    Get-Process WinCache -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    
     Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
     Write-Host '[+] Desinstalado correctamente.'
     return
@@ -310,6 +335,11 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
 }
 
 # 6. ACTUALIZACIÓN DEL SCRIPT
+Write-Host '[*] Actualizando copia local del script...'
+if (Test-Path $SelfPs) {
+    Remove-Item $SelfPs -Force -ErrorAction SilentlyContinue
+}
+
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
     Copy-Item $scriptPath $SelfPs -Force
     Unblock-File $SelfPs -ErrorAction SilentlyContinue
@@ -330,10 +360,8 @@ if ($DiscordWebhook) { $argList += " -DiscordWebhook `"$DiscordWebhook`"" }
 $argList += " -Run -NoElevate"
 
 $Action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argList -WorkingDirectory $Root
-# DOBLE TRIGGER: Al Iniciar Sistema y Al Iniciar Sesión
 $Trigger1 = New-ScheduledTaskTrigger -AtStartup
 $Trigger2 = New-ScheduledTaskTrigger -AtLogOn
-# CONFIGURACIÓN: Reintentar 999 veces cada 1 minuto si falla
 $Settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Hours 0)
 $Principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
